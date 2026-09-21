@@ -21,6 +21,7 @@ const LEGACY_REMOTE_WORKSPACE_RPC_CHANNELS = [
   "pluginsService",
   "pluginManagementService",
   "commandsService",
+  "subagentsService",
   "hooksService",
   "modelSelectionService",
   "providerSettingsService",

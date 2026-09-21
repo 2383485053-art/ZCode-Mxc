@@ -41,7 +41,10 @@ import { logger } from "@/logger.js";
 import { settingsResourceRowInteraction } from "@/settings/settingsResourceRowInteraction.js";
 import { useConfirmDialog } from "@/hooks/useConfirmDialog.js";
 import { useModelSelectionServiceView } from "@/hooks/useModelSelectionView.js";
-import { useBaseWorkspaceServices } from "@/hooks/useWorkspaceServices.js";
+import {
+  useBaseWorkspaceServices,
+  useWorkspaceServicesResolution,
+} from "@/hooks/useWorkspaceServices.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import {
   buildRegistryModelSelectGroups,
@@ -1270,11 +1273,6 @@ export function SubagentsSection({ onManageModels }: SubagentsSectionProps) {
   const availablePlugins = usePluginManagementStore((state) => state.availablePlugins);
   const initializePlugins = usePluginManagementStore((state) => state.initialize);
   const localHostServices = useBaseWorkspaceServices();
-  const modelSelectionRead = useModelSelectionServiceView(localHostServices.modelSelectionService);
-  const modelSelectionView =
-    modelSelectionRead.state.status === "ready" ? modelSelectionRead.state.view : null;
-  // 非 Ready 生命周期均保留表单中的模型意图；error/unavailable 不能被误判成模型已失效。
-  const modelSelectionLoading = modelSelectionRead.state.status !== "ready";
   const tabs = useTabStore((state) => state.tabs);
   const workspaceTabs = useMemo(() => {
     const seen = new Set<string>();
@@ -1282,8 +1280,6 @@ export function SubagentsSection({ onManageModels }: SubagentsSectionProps) {
       tabs
         .filter(isWorkspaceTab)
         .filter(isPluginScopeWorkspaceConnected)
-        // Subagent Settings 只管理 Local Environment；远程配置浏览/编辑是独立产品能力。
-        .filter((tab) => !tab.remoteTarget && !tab.remoteSessionId && !tab.workspaceIdentity)
         .filter((tab) => {
           const key = getPluginWorkspaceKey(tab);
           if (seen.has(key)) return false;
@@ -1307,11 +1303,30 @@ export function SubagentsSection({ onManageModels }: SubagentsSectionProps) {
     (tab) => getPluginWorkspaceKey(tab) === selectedScopeKey,
   );
   const targetWorkspacePath = selectedWorkspace?.workspacePath ?? "";
-  const targetWorkspaceIdentity = undefined;
-  const { pluginManagementService, subagentsService } = localHostServices;
+  // 子智能体定义随目标环境落盘：workspace 作用域选中远程工作区时读写远端服务；
+  // user 作用域仍固定 Local Host，不随当前激活的远程 tab 漂移。
+  const targetServicesResolution = useWorkspaceServicesResolution(
+    selectedWorkspace?.workspacePath ?? null,
+    selectedWorkspace?.remoteSessionId,
+    selectedWorkspace?.workspaceIdentity,
+    selectedWorkspace?.remoteTarget,
+  );
+  const scopeServices = selectedWorkspace ? targetServicesResolution.services : localHostServices;
+  const targetWorkspaceIdentity = selectedWorkspace?.workspaceIdentity;
+  const { pluginManagementService, subagentsService } = scopeServices;
+  const modelSelectionRead = useModelSelectionServiceView(scopeServices.modelSelectionService);
+  const modelSelectionView =
+    modelSelectionRead.state.status === "ready" ? modelSelectionRead.state.view : null;
+  // 非 Ready 生命周期均保留表单中的模型意图；error/unavailable 不能被误判成模型已失效。
+  const modelSelectionLoading = modelSelectionRead.state.status !== "ready";
   const activeScope = selectedWorkspace ? "workspace" : "user";
   const latestRequestIdRef = useRef(0);
-  const pluginInventoryWorkspacePath = targetWorkspacePath || workspaceTabs[0]?.workspacePath;
+  // user 作用域的插件清单只从本地工作区取回退路径，避免把远程路径发给本机服务。
+  const pluginInventoryWorkspacePath =
+    selectedWorkspace?.workspacePath ??
+    workspaceTabs.find(
+      (tab) => !tab.remoteTarget && !tab.remoteSessionId && !tab.workspaceIdentity,
+    )?.workspacePath;
   const chatModelSelectGroups = useMemo(() => {
     if (!modelSelectionView) return [];
     return buildRegistryModelSelectGroups(ZCODE_AGENT_PROVIDER, modelSelectionView, {
@@ -1361,11 +1376,14 @@ export function SubagentsSection({ onManageModels }: SubagentsSectionProps) {
   );
 
   useEffect(() => {
+    // remote-waiting 期目标服务尚未注册，此时发 RPC 只会打到断连代理；就绪后再加载。
+    if (!targetServicesResolution.rpcReady) return;
     void loadAgents(true);
-  }, [loadAgents]);
+  }, [loadAgents, targetServicesResolution.rpcReady]);
 
   useEffect(() => {
     if (!pluginInventoryWorkspacePath) return;
+    if (!targetServicesResolution.rpcReady) return;
     let active = true;
     // 冷启动 seed 晚于文件首读，旧用户页又跳过 inventory 初始化，导致插件直到重进才出现。
     // 复用已有初始化完成事件刷新只读资源，不阻塞用户列表、不轮询，也不把项目配置带入用户页。
@@ -1392,6 +1410,7 @@ export function SubagentsSection({ onManageModels }: SubagentsSectionProps) {
     loadAgents,
     pluginInventoryWorkspacePath,
     pluginManagementService,
+    targetServicesResolution.rpcReady,
     targetWorkspaceIdentity,
   ]);
 

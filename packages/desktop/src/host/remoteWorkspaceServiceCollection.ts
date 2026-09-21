@@ -59,7 +59,6 @@ import {
   createCodingPlanSubscriptionService,
   createClientScenesService,
   createServiceLogger,
-  createSubagentsService,
   createMemoryService,
   createRemoteConversationShareArtifactSource,
   OAuthCredentialRepo,
@@ -356,7 +355,9 @@ export function createRemoteWorkspaceServiceCollection(params: {
     // 远端设置页插件管理也必须打到远端 agent（插件目录在远端文件系统）。
     .register(IPluginManagementService, params.connectionServices.pluginManagementService)
     .register(ICommandsService, params.connectionServices.commandsService)
-    .register(ISubagentsService, createSubagentsService({ isDesktopRuntime: true }))
+    // 远端 workspace 的子智能体定义位于远端文件系统（~/.zcode/agents 与
+    // <workspace>/.zcode/agents），设置页读写必须打到远端服务，不能扫本机目录。
+    .register(ISubagentsService, params.connectionServices.subagentsService)
     .register(IHooksService, params.connectionServices.hooksService)
     .register(IMemoryService, createMemoryService())
     .register(
