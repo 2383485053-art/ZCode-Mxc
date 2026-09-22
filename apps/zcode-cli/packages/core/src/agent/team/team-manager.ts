@@ -6,21 +6,28 @@ import type {
   TeamCreateResult,
   TeamDeleteRequest,
   TeamDeleteResult,
+  TeamMember,
+  TeamMemberRegistration,
   TeamPort,
+  TeamRosterResult,
   TeamSendResult,
   TeamSendMessage,
 } from "@zcode/contracts";
 import { isPidAlive, TeamStore, TeamStoreError } from "./team-store.js";
 
+/** 成员默认上限（设计 2.3 的 3-5 甜点）；settings 键 team.maxTeammates 随治理层 PR 接入。 */
+const DEFAULT_MAX_TEAMMATES = 5;
+
 /**
- * TeamManager（M1 实体层）：团队生命周期 + 进程内路由。
+ * TeamManager（M1 实体层 + roster）：团队生命周期、成员名册、进程内路由。
  * 挂在 lead 的 app 装配里，随主会话存续；跨进程互斥由磁盘上的 leadPid 活性判定兜底。
  *
- * 本 PR（实体层）的边界：尚无成员 spawn/投递唤醒——route 只写持久化镜像并返回 queued，
- * 事件总线消费方随通信层 PR 接上；team_delete 尚无关机握手（断言成员为空）。
+ * 本 PR 的边界：投递唤醒（steer/复活）随通信层下半场——route 校验白名单并写持久化镜像，
+ * 返回 queued；team_delete 尚无关机握手（roster 非空即拒绝）。
  */
 export class TeamManager {
   private active: { name: string; generation: number } | undefined;
+  private roster: TeamMember[] = [];
 
   constructor(
     private readonly store: TeamStore,
@@ -64,6 +71,7 @@ export class TeamManager {
       };
       await this.store.createTeamDir(request.name, config);
       this.active = { name: request.name, generation: config.generation };
+      this.roster = [];
       this.logger?.info?.("Team created", { module: "core.agent.team", team: request.name });
       return {
         status: "success",
@@ -89,15 +97,16 @@ export class TeamManager {
           name,
         );
       }
-      if (config.members.length > 0) {
-        // 关机握手随通信层 PR 落地；实体层阶段不可能有成员，出现即状态异常，拒绝删除。
+      if (config.members.length > 0 || this.roster.length > 0) {
+        // 关机握手随通信层下半场；此前 roster 非空一律拒绝删除。
         return failed(
-          `Team '${name}' still has ${config.members.length} member(s); shutdown handshake is not implemented yet.`,
+          `Team '${name}' still has ${Math.max(config.members.length, this.roster.length)} member(s); remove them (or wait for the shutdown handshake) before deleting.`,
           name,
         );
       }
       await this.store.archiveTeam(name);
       this.active = undefined;
+      this.roster = [];
       this.logger?.info?.("Team deleted", { module: "core.agent.team", team: name });
       return { status: "success", teamName: name, message: `Team '${name}' archived and deleted.` };
     } catch (error) {
@@ -105,32 +114,112 @@ export class TeamManager {
     }
   }
 
+  async reserveMember(registration: TeamMemberRegistration): Promise<TeamRosterResult> {
+    if (!this.active) {
+      return rosterFailed("No active team. Create a team first with team_create.");
+    }
+    if (registration.name === "lead") {
+      return rosterFailed("'lead' is reserved for the lead; pick another teammate name.");
+    }
+    if (this.roster.some((member) => member.name === registration.name)) {
+      return rosterFailed(`Teammate '${registration.name}' already exists.`);
+    }
+    if (this.roster.length >= DEFAULT_MAX_TEAMMATES) {
+      return rosterFailed(
+        `Team is full (${DEFAULT_MAX_TEAMMATES} teammates). Finish work before spawning more.`,
+      );
+    }
+    this.roster.push({
+      name: registration.name,
+      ...(registration.profile ? { profile: registration.profile } : {}),
+      ...(registration.readOnly !== undefined ? { readOnly: registration.readOnly } : {}),
+      ...(registration.maxTurns !== undefined ? { maxTurns: registration.maxTurns } : {}),
+      state: "spawning",
+    });
+    const persistError = await this.persistRoster();
+    if (persistError) {
+      this.roster = this.roster.filter((member) => member.name !== registration.name);
+      return rosterFailed(`Teammate reservation could not be persisted: ${persistError}`);
+    }
+    return {
+      status: "success",
+      teamName: this.active.name,
+      memberName: registration.name,
+      roster: [...this.roster],
+      message: `Teammate '${registration.name}' reserved.`,
+    };
+  }
+
+  async completeMemberSpawn(
+    memberName: string,
+    agent: { agentId: string },
+  ): Promise<TeamRosterResult> {
+    const member = this.roster.find((entry) => entry.name === memberName);
+    if (!member || !this.active) {
+      return rosterFailed(`Teammate '${memberName}' is not reserved.`);
+    }
+    member.agentId = agent.agentId;
+    member.state = "idle";
+    const persistError = await this.persistRoster();
+    if (persistError) {
+      return rosterFailed(`Teammate spawn could not be persisted: ${persistError}`, memberName);
+    }
+    return {
+      status: "success",
+      teamName: this.active.name,
+      memberName,
+      agentId: agent.agentId,
+      roster: [...this.roster],
+      message: `Teammate '${memberName}' spawned (agent ${agent.agentId}).`,
+    };
+  }
+
+  async removeMember(memberName: string, reason?: string): Promise<TeamRosterResult> {
+    const member = this.roster.find((entry) => entry.name === memberName);
+    if (!member || !this.active) {
+      return rosterFailed(`Teammate '${memberName}' is not on the roster.`);
+    }
+    this.roster = this.roster.filter((entry) => entry.name !== memberName);
+    const persistError = await this.persistRoster();
+    if (persistError) {
+      // 回滚失败意味着磁盘与内存名册分叉——把成员放回去并如实报错，交上层决策。
+      this.roster.push(member);
+      return rosterFailed(`Teammate removal could not be persisted: ${persistError}`, memberName);
+    }
+    return {
+      status: "success",
+      teamName: this.active.name,
+      memberName,
+      roster: [...this.roster],
+      message: reason
+        ? `Teammate '${memberName}' removed: ${reason}`
+        : `Teammate '${memberName}' removed.`,
+    };
+  }
+
   /**
-   * 路由（实体层部分）：白名单校验 + 持久化镜像 + queued 应答。
+   * 路由（实体层部分）：roster 白名单校验 + 持久化镜像 + queued 应答。
    * 每条消息必有明确结局（送达/入队/拒绝，设计 2.4）——本层负责「入队」与「拒绝」，
-   * 「送达」（steer/复活唤醒）随通信层 PR 接在镜像写入之后。
+   * 「送达」（steer/复活唤醒）随通信层下半场接在镜像写入之后。
+   * peer 点对点投递自动向 lead 信箱写一行摘要（cc-lead，设计 2.4：lead 对网状对话保持可见）。
    */
   route(from: string, to: string, request: TeamSendMessage): TeamSendResult {
     const messageId = `teammsg_${randomUUID()}`;
     if (!this.active) {
-      return {
-        status: "failed",
-        messageId,
-        message: "Message was not delivered.",
-        error: "No active team. Create a team first with team_create.",
-      };
+      return sendFailed(messageId, "No active team. Create a team first with team_create.");
     }
     if (to === from) {
-      return {
-        status: "failed",
-        messageId,
-        message: "Message was not delivered.",
-        error: "Cannot send a team message to yourself.",
-      };
+      return sendFailed(messageId, "Cannot send a team message to yourself.");
     }
-    // 成员 roster 校验随 spawn PR 接入；当前唯一合法收件人是 lead。
-    if (to !== "lead") {
-      return unknownTeammate(messageId, to);
+    const toMember = to === "lead" ? undefined : this.roster.find((member) => member.name === to);
+    if (to !== "lead" && !toMember) {
+      return sendFailed(
+        messageId,
+        `Unknown teammate '${to}'. Current roster: lead${this.roster.map((m) => `, ${m.name}`).join("")}.`,
+      );
+    }
+    if (toMember?.state === "spawning") {
+      return sendFailed(messageId, `Teammate '${to}' is still spawning; retry shortly.`);
     }
     const entry = {
       messageId,
@@ -142,21 +231,44 @@ export class TeamManager {
     };
     // 镜像写入是 async 的，但端口契约是同步应答（同 CoordinatorResponsePort 的入队 ack 纪律）。
     // fire-and-forget + 失败日志：queued 的语义由内存态保证，镜像丢失不回滚应答。
-    void this.store
-      .appendInboxMessage(this.active.name, to, entry)
-      .catch((error: unknown) => {
-        this.logger?.warn?.("Team inbox mirror write failed", {
-          module: "core.agent.team",
-          team: this.active?.name,
-          messageId,
-          error: errorMessage(error),
-        });
+    void this.mirrorAppend(to, entry);
+    if (from !== "lead" && to !== "lead") {
+      void this.mirrorAppend("lead", {
+        ...entry,
+        messageId: `${messageId}_cc`,
+        summary: `[cc-lead] ${from} → ${to}: ${request.summary}`,
+        message: `${from} sent to ${to}: ${request.message}`,
       });
-    return {
-      status: "success",
-      messageId,
-      message: `Message queued for ${to}.`,
-    };
+    }
+    return { status: "success", messageId, message: `Message queued for ${to}.` };
+  }
+
+  private async mirrorAppend(
+    to: string,
+    entry: Parameters<TeamStore["appendInboxMessage"]>[2],
+  ): Promise<void> {
+    if (!this.active) return;
+    try {
+      await this.store.appendInboxMessage(this.active.name, to, entry);
+    } catch (error) {
+      this.logger?.warn?.("Team inbox mirror write failed", {
+        module: "core.agent.team",
+        team: this.active.name,
+        messageId: entry.messageId,
+        error: errorMessage(error),
+      });
+    }
+  }
+
+  private async persistRoster(): Promise<string | undefined> {
+    if (!this.active) return "no active team";
+    try {
+      const config = await this.store.readConfig(this.active.name);
+      await this.store.writeConfig(this.active.name, { ...config, members: this.roster });
+      return undefined;
+    } catch (error) {
+      return errorMessage(error);
+    }
   }
 
   private async readConfigOrSweep(name: string) {
@@ -180,10 +292,14 @@ export function createLeadTeamPort(manager: TeamManager): LeadTeamPort {
     send: (to, request) => manager.route("lead", to, request),
     createTeam: (request) => manager.createTeam(request),
     deleteTeam: (request) => manager.deleteTeam(request),
+    reserveMember: (registration) => manager.reserveMember(registration),
+    completeMemberSpawn: (memberName, agent) => manager.completeMemberSpawn(memberName, agent),
+    removeMember: (memberName, reason) => manager.removeMember(memberName, reason),
+    createMemberPort: (memberName) => createMemberTeamPort(manager, memberName),
   };
 }
 
-/** 成员窄面端口（spawn PR 用）：identity 同样闭包绑定。 */
+/** 成员窄面端口（注入缝用）：identity 同样闭包绑定。 */
 export function createMemberTeamPort(manager: TeamManager, memberName: string): TeamPort {
   return {
     send: (to, request) => manager.route(memberName, to, request),
@@ -195,13 +311,17 @@ function failed(reason: string, teamName?: string): TeamCreateResult & TeamDelet
   return { status: "failed", ...(teamName ? { teamName } : {}), message: reason, error: reason };
 }
 
-function unknownTeammate(messageId: string, to: string): TeamSendResult {
+function rosterFailed(reason: string, memberName?: string): TeamRosterResult {
   return {
     status: "failed",
-    messageId,
-    message: "Message was not delivered.",
-    error: `Unknown teammate '${to}'. Teammate spawn arrives with the communication layer; the only valid recipient today is 'lead'.`,
+    ...(memberName ? { memberName } : {}),
+    message: reason,
+    error: reason,
   };
+}
+
+function sendFailed(messageId: string, reason: string): TeamSendResult {
+  return { status: "failed", messageId, message: "Message was not delivered.", error: reason };
 }
 
 function errorMessage(error: unknown): string {

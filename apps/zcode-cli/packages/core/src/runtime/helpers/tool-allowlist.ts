@@ -5,6 +5,7 @@ import {
   RESPOND_TO_COORDINATOR_TOOL_NAME,
   RESUME_WORKFLOW_RUN_TOOL_NAME,
   SAVE_WORKFLOW_TOOL_NAME,
+  TEAM_SEND_TOOL_NAME,
 } from "@zcode/contracts";
 import { EXPLORE_AGENT_ALLOWED_TOOLS } from "../../subagent/explore-tools.js";
 import type { AgentRuntimeConfig } from "../types.js";
@@ -104,11 +105,14 @@ function appendChildControlTool(
   }
 
   if (config.taskType === "subagent_child") {
-    if (allowlist.includes(RESPOND_TO_COORDINATOR_TOOL_NAME)) {
-      return allowlist;
-    }
     // Explore 会在 runtime 注册前再次求工具交集，child 控制工具必须在最终结果补回。
-    return [...allowlist, RESPOND_TO_COORDINATOR_TOOL_NAME];
+    // team_send 与 RespondToCoordinator 同类补回（四审②）：profile 显式 allowedTools 与
+    // explore 交集都会滤掉端口门控工具——allowlist 只表达「不挡」，授权仍在注册门
+    // （deps.teamPort 在场才注册）。非团队成员 child 多一个名字不会注册，无害。
+    const appended = new Set(allowlist);
+    appended.add(RESPOND_TO_COORDINATOR_TOOL_NAME);
+    appended.add(TEAM_SEND_TOOL_NAME);
+    return [...appended];
   }
 
   // workflow child 没有 allowlist 收窄（persona 无工具档位，工具面只有减法，见

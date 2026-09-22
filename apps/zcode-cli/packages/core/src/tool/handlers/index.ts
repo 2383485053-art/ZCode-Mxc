@@ -17,6 +17,7 @@ import {
   TEAM_CREATE_TOOL_NAME,
   TEAM_DELETE_TOOL_NAME,
   TEAM_SEND_TOOL_NAME,
+  TEAM_SPAWN_TEAMMATE_TOOL_NAME,
   type JsonSchema,
 } from "@zcode/contracts";
 import type { ToolEntry } from "../types.js";
@@ -58,6 +59,7 @@ import { respondToCoordinatorToolEntry } from "./respond-to-coordinator.js";
 import { teamSendToolEntry } from "./team-send.js";
 import { teamCreateToolEntry } from "./team-create.js";
 import { teamDeleteToolEntry } from "./team-delete.js";
+import { teamSpawnTeammateToolEntry } from "./team-spawn-teammate.js";
 import { createSubmitResultToolEntry, submitResultToolEntry } from "./submit-result.js";
 import { escalateToolEntry } from "./escalate.js";
 import { resolveWorkflowQuestionToolEntry } from "./resolve-workflow-question.js";
@@ -106,6 +108,7 @@ export const builtInTools: ToolEntry[] = [
   // lead 生命周期工具：与 team_send 不同门（includeTeamAdmin），只有 lead 句柄才注册。
   teamCreateToolEntry,
   teamDeleteToolEntry,
+  teamSpawnTeammateToolEntry,
   submitResultToolEntry,
   // actor 的升级通道。与 submit_result 完全同构：
   // 端口在场即注册（includeEscalate），`tools:"none"` 下由 workflow_child 的 allowlist
@@ -250,7 +253,8 @@ export function registerBuiltInTools(
     // 团队生命周期（lead 独占）：门是 lead 句柄的特征检测，成员端口不满足。
     if (
       (entry.metadata.name === TEAM_CREATE_TOOL_NAME ||
-        entry.metadata.name === TEAM_DELETE_TOOL_NAME) &&
+        entry.metadata.name === TEAM_DELETE_TOOL_NAME ||
+        entry.metadata.name === TEAM_SPAWN_TEAMMATE_TOOL_NAME) &&
       options.includeTeamAdmin !== true
     ) {
       continue;

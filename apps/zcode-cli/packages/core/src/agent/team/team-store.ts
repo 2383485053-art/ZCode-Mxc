@@ -110,6 +110,12 @@ export class TeamStore {
     await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
   }
 
+  /** roster 变更的落盘通道（读-改-写；单团队单 lead 写者，无并发写者竞争）。 */
+  async writeConfig(teamName: string, config: TeamConfigFile): Promise<void> {
+    const { configPath } = this.location(teamName);
+    await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+  }
+
   async appendInboxMessage(
     teamName: string,
     member: string,

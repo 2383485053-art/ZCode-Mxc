@@ -1,5 +1,5 @@
 /* eslint-disable max-lines -- subagent runtime wiring 集中衔接 child runtime、tool pool、权限、MCP 与 activity watchdog，拆分需单独迁移。 */
-import { RESPOND_TO_COORDINATOR_TOOL_NAME } from "@zcode/contracts";
+import { isLeadTeamPort, RESPOND_TO_COORDINATOR_TOOL_NAME } from "@zcode/contracts";
 import type { SubagentRunOptions } from "@zcode/contracts";
 import {
   defaultScheduler,
@@ -312,9 +312,14 @@ export function createDefaultSubagentPort(
             parentToolCallId,
             enqueue: (input) => this.enqueueSubagentMessage(input),
           }),
-          // Agent Teams M1 手术点：团队成员子会话在此注入 teamPort（闭包携带 from 身份，
-          // 模型不可谎报）。spike 阶段恒缺席——team_send 不在任何会话注册，非团队路径零影响。
-          teamPort: undefined,
+          // Agent Teams 注入缝：team_spawn_teammate 发起的子代理在此拿到成员端口
+          // （from 身份闭包绑定，模型不可谎报）；普通 spawn 不带 teamMemberName，恒缺席。
+          // ⚠️ 唤醒路径（resumeTerminalAgentInBackground）尚未透传 teamMemberName——
+          // 复活的成员暂无 teamPort，随通信层下半场补上。
+          teamPort:
+            request.teamMemberName !== undefined && isLeadTeamPort(deps.teamPort)
+              ? deps.teamPort.createMemberPort(request.teamMemberName)
+              : undefined,
           // Explore 使用独立只读权限配置；general-purpose 和自定义 agent 继承父权限服务。
           permissionService: builtInExplore
             ? new PermissionService(defaultPermissionConfig)

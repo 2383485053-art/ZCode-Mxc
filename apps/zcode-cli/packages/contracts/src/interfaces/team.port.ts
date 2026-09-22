@@ -12,6 +12,9 @@ export const TEAM_NAME_SCHEMA = z
 
 export const LEAD_MEMBER_NAME = "lead";
 
+/** 团队成员每轮 turn 预算默认（红旗 1：子代理默认 4 轮远不够团队协作；profile 可覆盖）。 */
+export const TEAMMATE_DEFAULT_MAX_TURNS = 20;
+
 export const TEAM_MEMBER_STATE_SCHEMA = z.enum([
   "spawning",
   "idle",
@@ -23,7 +26,8 @@ export type TeamMemberState = z.infer<typeof TEAM_MEMBER_STATE_SCHEMA>;
 
 export const TEAM_MEMBER_SCHEMA = z.object({
   name: z.string().min(1).max(32),
-  agentId: z.string().min(1),
+  // 后台 spawn 的返回里才有 agentId;spawning 态（已占名额未起跑）尚无。
+  agentId: z.string().min(1).optional(),
   profile: z.string().optional(),
   model: z.string().optional(),
   readOnly: z.boolean().optional(),
@@ -110,9 +114,37 @@ export interface TeamDeleteResult {
  * 一次性的，而团队是会话中途建的，句柄必须先于注册在场；无团队时各操作直接返回 failed。
  * 成员（子会话）只拿窄面 TeamPort，永远不满足 isLeadTeamPort。
  */
+export interface TeamMemberRegistration {
+  name: string;
+  profile?: string;
+  readOnly?: boolean;
+  maxTurns?: number;
+}
+
+export interface TeamRosterResult {
+  status: "success" | "failed";
+  teamName?: string;
+  memberName?: string;
+  agentId?: string;
+  roster?: TeamMember[];
+  message: string;
+  error?: string;
+}
+
 export interface LeadTeamPort extends TeamPort {
   createTeam(request: TeamCreateRequest): Promise<TeamCreateResult>;
   deleteTeam(request: TeamDeleteRequest): Promise<TeamDeleteResult>;
+  /** 占位并落盘（state=spawning）；失败（无团队/重名/超上限）不占名额。 */
+  reserveMember(registration: TeamMemberRegistration): Promise<TeamRosterResult>;
+  /** spawn 成功回填 agentId，state→idle。 */
+  completeMemberSpawn(memberName: string, agent: { agentId: string }): Promise<TeamRosterResult>;
+  /** spawn 失败/成员移除：回滚 roster 条目并落盘。 */
+  removeMember(memberName: string, reason?: string): Promise<TeamRosterResult>;
+  /**
+   * 给团队成员铸窄面端口（注入缝用）：send 的 from 闭包绑定为该成员名。
+   * 只有 lead 句柄实现——成员端口永远不满足 isLeadTeamPort。
+   */
+  createMemberPort(memberName: string): TeamPort;
 }
 
 /** 注册门特征检测：成员端口永远不满足（只有 lead 句柄实现生命周期操作）。 */

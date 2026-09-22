@@ -8,6 +8,7 @@ import {
   CoreErrorType,
   DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS,
   SessionEventType,
+  TEAMMATE_DEFAULT_MAX_TURNS,
   createChildTraceContext,
   createCoreError,
   createSessionEvent,
@@ -84,6 +85,8 @@ export interface ExploreSubagentRuntimeRequest {
   reportActivity?: () => void;
   resumeFromStore?: boolean;
   systemPrompt?: string;
+  /** Agent Teams：非空 = 团队成员 spawn，child deps 据此注入成员 TeamPort。 */
+  teamMemberName?: string;
   workingDirectory: string;
   workspaceRoot: string;
   traceContext: TraceContext;
@@ -1143,7 +1146,11 @@ async function runAgentToCompletion(
       disallowedTools: lifecycle.profile.disallowedTools,
       sessionId: lifecycle.childSessionId,
       description: request.description,
-      maxTurns: lifecycle.profile.maxTurns,
+      // 团队成员的 turn 预算默认 20（红旗 1）；显式值 > profile 声明 > 成员默认。
+      maxTurns:
+        request.maxTurns ??
+        lifecycle.profile.maxTurns ??
+        (request.teamMemberName !== undefined ? TEAMMATE_DEFAULT_MAX_TURNS : undefined),
       onSessionReady: notifySessionReady,
       permissionMode: lifecycle.profile.permissionMode,
       prompt: request.prompt,
@@ -1152,6 +1159,7 @@ async function runAgentToCompletion(
       reportActivity: monitorOptions.reportActivity,
       resumeFromStore: executionOptions.resumeFromStore,
       systemPrompt: lifecycle.profile.systemPrompt,
+      teamMemberName: request.teamMemberName,
       workingDirectory: request.workingDirectory,
       workspaceRoot: request.workspaceRoot,
       traceContext: lifecycle.childTraceContext,
