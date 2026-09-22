@@ -63,8 +63,7 @@ export function createTeamFileSystemGate(
     }
   };
 
-  return {
-    ...port,
+  const gated: Pick<FileSystemPort, "writeTextFile" | "removeFile" | "createDirectory"> = {
     writeTextFile: (request, options) => {
       assertWritable(request.path);
       return port.writeTextFile(request, options);
@@ -78,6 +77,22 @@ export function createTeamFileSystemGate(
       return port.createDirectory(request, options);
     },
   };
+
+  // 真实适配器是 class 实例——方法在原型上，对象展开（{...port}）一个都拷不走，
+  // 成员侧 readTextFile/stat 等随即 "not a function"（M3 真机验收暴露，冒烟的对象
+  // 字面量假端口掩盖了错配）。Proxy 只拦三个写方法，其余全量转发（含未来新增成员），
+  // bind 防 class 方法的 this 依赖。
+  return new Proxy(port, {
+    get: (target, prop) => {
+      if (prop === "writeTextFile") return gated.writeTextFile;
+      if (prop === "removeFile") return gated.removeFile;
+      if (prop === "createDirectory") return gated.createDirectory;
+      const value = Reflect.get(target, prop) as unknown;
+      return typeof value === "function"
+        ? (value as (...args: unknown[]) => unknown).bind(target)
+        : value;
+    },
+  });
 }
 
 /** 目录包含判定：路径边界（防 /foo 误含 /foobar）+ Windows 大小写不敏感。 */
