@@ -312,6 +312,9 @@ export function createDefaultSubagentPort(
             parentToolCallId,
             enqueue: (input) => this.enqueueSubagentMessage(input),
           }),
+          // Agent Teams M1 手术点：团队成员子会话在此注入 teamPort（闭包携带 from 身份，
+          // 模型不可谎报）。spike 阶段恒缺席——team_send 不在任何会话注册，非团队路径零影响。
+          teamPort: undefined,
           // Explore 使用独立只读权限配置；general-purpose 和自定义 agent 继承父权限服务。
           permissionService: builtInExplore
             ? new PermissionService(defaultPermissionConfig)

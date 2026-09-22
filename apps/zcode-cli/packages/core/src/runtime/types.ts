@@ -17,6 +17,7 @@ import type {
   ResolvedUserInstructions,
   StableForkGoalBoundaryMetadata,
   StableForkTargetMetadata,
+  TeamPort,
   WorkspaceHookBundleSnapshot,
   WorkspaceId,
 } from "@zcode/contracts";
@@ -338,6 +339,12 @@ export interface AgentRuntimeDeps {
   mcpPort?: McpPort;
   subagentPort?: SubagentPort;
   coordinatorResponsePort?: CoordinatorResponsePort;
+  /**
+   * 团队通信端口：lead 与团队成员两侧注入（lead=主会话启动期稳定句柄，成员=子会话注入），
+   * 存在即作为 team_send 工具的注册门。注入即授权：TeamManager 只给合法主体铸端口。
+   * 不能加 taskType 限定——lead 是 main 会话，加了会把 lead 的 team_send 砍掉。
+   */
+  teamPort?: TeamPort;
   /** 工作流 actor 提交终态结果的端口；存在即作为 submit_result 工具的注册门。 */
   workflowSubmitPort?: WorkflowSubmitPort;
   /**

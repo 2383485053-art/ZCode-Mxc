@@ -29,6 +29,7 @@ import type {
   SkillTelemetryMetadata,
   SubagentRunOptions,
   SubagentPort,
+  TeamPort,
   ToolArtifactStorePort,
   TraceContext,
   TraceId,
@@ -157,6 +158,8 @@ export interface ToolExecutionContext {
   skillPort?: SkillPort;
   subagentPort?: SubagentPort;
   coordinatorResponsePort?: CoordinatorResponsePort;
+  /** 团队通信端口（lead 与成员均可用）；缺席则 team_send handler 报配置错误（注册门已挡，这是兜底）。 */
+  teamPort?: TeamPort;
   /** 工作流 actor 提交终态结果并等待引擎裁决的端口；仅在 workflow actor 会话注入。 */
   workflowSubmitPort?: WorkflowSubmitPort;
   /** 工作流 actor 升级阻塞问题并等待主代理作答的端口；仅在 workflow actor 会话注入。 */
