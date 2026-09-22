@@ -814,6 +814,19 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       // 团队 hooks（M2）：TeammateIdle/TaskCompleted 通知转发给 lead runtime 的
       // hookRunner（Base 字段 runtime 补齐；hooks 未启用时静默跳过）。
       teamManager.attachTeamHook({ runTeamHook: (input) => runtime.runTeamHook(input) });
+      // lead 信箱注入钩子（M3 轮询后端）：500ms 轮询到的在途消息经主会话 steerTurn
+      // 在工具边界注入（guide，与成员收件同款原语）。无活跃 turn 时返回 false 留待下轮。
+      teamManager.attachLeadInbox({
+        inject: async (text) => {
+          const result = await runtime.steerTurn({
+            input: text,
+            inputPresentation: "coordinator_steer",
+            delivery: "guide",
+            inputId: `team_inbox_${Date.now()}`,
+          });
+          return result.kind !== "rejected";
+        },
+      });
     }
     markRuntimeConstructed({
       hasInjectedModelAdapter: options.modelAdapter !== undefined,

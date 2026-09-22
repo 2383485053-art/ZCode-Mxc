@@ -19,6 +19,12 @@ export const TeamSendInputSchema = z
       .min(1)
       .max(TEAM_SEND_MAX_CONTENT_CHARS)
       .describe("Plain text message content"),
+    delivery: z
+      .enum(["auto", "interject"])
+      .optional()
+      .describe(
+        "auto (default): busy teammates get the message at their next tool round, idle ones are resumed with it. interject: interrupt the teammate's current run and resume it with your message immediately (use for urgent corrections).",
+      ),
   })
   .strict();
 
@@ -32,7 +38,9 @@ export const TeamSendOutputSchema = z
     messageId: z.string(),
     message: z.string(),
     error: z.string().optional(),
-    delivery: z.enum(["queued", "steered", "resumed_background"]).optional(),
+    delivery: z
+      .enum(["queued", "steered", "resumed_background", "interrupted"])
+      .optional(),
     failed_recipients: z.array(z.string()).optional(),
   })
   .strict();

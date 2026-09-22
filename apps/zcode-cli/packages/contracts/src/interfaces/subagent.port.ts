@@ -73,9 +73,14 @@ export interface SubagentSendMessageRequest {
 
 export interface SubagentSendMessageOptions {
   signal?: AbortSignal;
+  /**
+   * Agent Teams interject（M3）：打断收件任务的当前 run（abort）并带消息从 store
+   * 原地续跑；仅对 running 任务生效，terminal 任务走既有复活路径。
+   */
+  interrupt?: boolean;
 }
 
-export type SubagentSendMessageDelivery = "queued" | "steered" | "resumed_background";
+export type SubagentSendMessageDelivery = "queued" | "steered" | "resumed_background" | "interrupted";
 
 export interface SubagentSendMessageResult {
   status: "success" | "failed";

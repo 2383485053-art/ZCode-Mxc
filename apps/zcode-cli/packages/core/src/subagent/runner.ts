@@ -922,7 +922,9 @@ async function sendMessageToLocalAgent(
 
   const message = createRuntimeTaskPendingMessage(request);
   if (!isTerminalRuntimeTask(task)) {
-    return deliverMessageToRunningAgent(registry, task, message);
+    return sendOptions?.interrupt === true
+      ? interruptAgentAndResume(options, profiles, registry, abortControllers, task, request, message)
+      : deliverMessageToRunningAgent(registry, task, message);
   }
 
   return resumeTerminalAgentInBackground(
@@ -934,6 +936,66 @@ async function sendMessageToLocalAgent(
     request,
     message,
   );
+}
+
+/**
+ * Agent Teams interject（M3）：打断 running 任务的当前 run（abort），等它落终态后走既有
+ * 复活路径带消息续跑（resumeFromStore）。打断前的对话状态都在 store 里，语义 = 打断
+ * 当前 turn 而非丢弃整个子会话。
+ */
+async function interruptAgentAndResume(
+  options: ExploreSubagentPortOptions,
+  profiles: readonly AgentProfile[],
+  registry: RuntimeTaskRegistry,
+  abortControllers: Map<string, AbortController>,
+  task: RuntimeTaskSnapshot,
+  request: SubagentSendMessageRequest,
+  message: RuntimeTaskPendingMessage,
+): Promise<SubagentSendMessageResult> {
+  const controller = abortControllers.get(task.agentId);
+  if (controller === undefined) {
+    // 没有 abort 句柄可打断（如已进入收尾）：退回边界注入，不硬失败。
+    return deliverMessageToRunningAgent(registry, task, message);
+  }
+  controller.abort(new Error(`Interrupted by coordinator message ${message.id}`));
+  const settled = await waitForTerminalTask(registry, task.agentId, 10_000);
+  if (settled === undefined) {
+    return createSendMessageFailure(
+      request,
+      `Cannot interrupt local agent ${task.agentId}: its run did not settle within 10s; the message was not delivered.`,
+    );
+  }
+  const resumed = await resumeTerminalAgentInBackground(
+    options,
+    profiles,
+    registry,
+    abortControllers,
+    settled,
+    request,
+    message,
+  );
+  if (resumed.status === "failed") {
+    return resumed;
+  }
+  return {
+    ...resumed,
+    delivery: "interrupted",
+    message: `Agent "${task.agentId}" was interrupted and resumed in the background with your message. You'll be notified when it finishes. Output: ${resumed.outputFile ?? task.outputFile}`,
+  };
+}
+
+async function waitForTerminalTask(
+  registry: RuntimeTaskRegistry,
+  agentId: string,
+  timeoutMs: number,
+): Promise<RuntimeTaskSnapshot | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const task = registry.get(agentId);
+    if (task !== undefined && isTerminalRuntimeTask(task)) return task;
+    if (Date.now() >= deadline) return undefined;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
 }
 
 async function deliverMessageToRunningAgent(

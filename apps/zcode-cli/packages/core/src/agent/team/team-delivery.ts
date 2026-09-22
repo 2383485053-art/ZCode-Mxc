@@ -21,16 +21,20 @@ export function createSubagentTeamDelivery(
       if (port.sendMessage === undefined) {
         return unavailable(target.memberName);
       }
-      return port.sendMessage({
-        sessionId: lead.sessionId,
-        parentToolCallId: "team_router",
-        to: target.agentId ?? target.memberName,
-        summary: entry.summary,
-        message: entry.message,
-        workingDirectory: lead.workingDirectory,
-        workspaceRoot: lead.workingDirectory,
-        trace: entry.trace,
-      });
+      return port.sendMessage(
+        {
+          sessionId: lead.sessionId,
+          parentToolCallId: "team_router",
+          to: target.agentId ?? target.memberName,
+          summary: entry.summary,
+          message: entry.message,
+          workingDirectory: lead.workingDirectory,
+          workspaceRoot: lead.workingDirectory,
+          trace: entry.trace,
+        },
+        // M3 interject：打断收件成员当前 run 并带消息原地续跑。
+        entry.interrupt === true ? { interrupt: true } : undefined,
+      );
     },
   };
 }

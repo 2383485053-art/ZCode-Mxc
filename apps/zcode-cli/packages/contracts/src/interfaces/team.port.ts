@@ -53,7 +53,11 @@ export const TEAM_CONFIG_FILE_SCHEMA = z.object({
 });
 export type TeamConfigFile = z.infer<typeof TEAM_CONFIG_FILE_SCHEMA>;
 
-/** inboxes/{member}.json 的落盘形状：M1 是持久化镜像（消费方是进程内事件总线），不是轮询源。 */
+/**
+ * inboxes/{member}.json 的落盘形状。M3 起带消费语义：deliveredAt 缺席 = 在途未消费
+ * （lead 信箱由 500ms 轮询注入消费，成员信箱由投递成功或复活简报消费）；截尾只裁
+ * 已消费旧条目，在途条目永不裁（箱内 32 在途配额封顶，数组不超 50）。
+ */
 export const TEAM_INBOX_FILE_SCHEMA = z.object({
   schemaVersion: z.literal(1),
   messages: z
@@ -65,6 +69,7 @@ export const TEAM_INBOX_FILE_SCHEMA = z.object({
         summary: z.string(),
         message: z.string(),
         queuedAt: z.string().min(1),
+        deliveredAt: z.string().min(1).optional(),
       }),
     )
     .max(50),
@@ -205,14 +210,20 @@ export interface TeamSendMessage {
   summary: string;
   message: string;
   trace: TraceContext;
+  /**
+   * M3 interject：默认 auto（busy→steer 工具边界注入，idle→复活）；interject 打断
+   * 收件成员当前 run 并带消息原地续跑（abort + resume from store）。
+   */
+  delivery?: "auto" | "interject";
 }
 
 /**
  * 消息结局（设计 2.4：每条消息必有明确结局）。queued = 仅入队（收件人是 lead，
  * 或成员任务不在场由注册表排队）；steered = 已注入收件成员的活跃 turn；
- * resumed_background = 成员空闲，已带消息后台复活。
+ * resumed_background = 成员空闲，已带消息后台复活；interrupted = 成员 run 被打断
+ * （interject）并带消息原地续跑。
  */
-export type TeamDeliveryState = "queued" | "steered" | "resumed_background";
+export type TeamDeliveryState = "queued" | "steered" | "resumed_background" | "interrupted";
 
 export interface TeamSendResult {
   status: "success" | "failed";
@@ -241,8 +252,24 @@ export interface TeamDeliveryTargetRef {
 export interface TeamDeliveryTarget {
   sendMessage(
     target: TeamDeliveryTargetRef,
-    entry: { summary: string; message: string; trace: TraceContext },
+    entry: {
+      summary: string;
+      message: string;
+      trace: TraceContext;
+      /** M3 interject：打断收件成员当前 run 并带消息原地续跑（缺省 false）。 */
+      interrupt?: boolean;
+    },
   ): Promise<SubagentSendMessageResult>;
+}
+
+/**
+ * lead 信箱注入钩子（M3 轮询后端）：TeamManager 500ms 轮询 lead 信箱的在途消息，
+ * 经此钩子注入 lead 的活跃 turn（工具边界 steer）。返回 false = 当前无活跃 turn，
+ * 消息留在信箱下一轮再试。由装配层回填；缺席时 lead 信箱只积累（配额封顶），
+ * 等待 lead 侧自然消费（team_collect 报告/接管交接）。
+ */
+export interface TeamLeadInboxTarget {
+  inject(text: string): Promise<boolean>;
 }
 
 /**
