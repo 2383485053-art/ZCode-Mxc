@@ -447,6 +447,12 @@ export interface LeadTeamPort extends TeamPort {
   readMemberPendingMessages(memberName: string): Promise<TeamPendingMessage[]>;
   /** 标记成员信箱消息已消费（复活 spawn 成功后调用）。 */
   markMemberMessagesDelivered(memberName: string, messageIds: string[]): Promise<void>;
+  /**
+   * rewind 团队重置广播（M3，O8 另半边）：lead 会话 rewind 提交后调用——运行中成员
+   * steer 一条重置通知；已停成员在信箱留一条在途通知（下次唤醒补送）；lead 自己的信箱
+   * 也留一条（轮询注入，作重置的可见回执）。看板保持权威，任务不强制释放。
+   */
+  resetTeamAfterRewind(): Promise<void>;
 }
 
 /** 成员信箱在途消息的复活补送视图。 */

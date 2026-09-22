@@ -46,6 +46,7 @@ import {
   TEAM_COLLECT_DEFAULT_TIMEOUT_MS,
   TEAM_COLLECT_MAX_TIMEOUT_MS,
   TEAM_COLLECT_MIN_TIMEOUT_MS,
+  createTraceId,
 } from "@zcode/contracts";
 import { attachWorktree, commitAll, createWorktree, diffFiles, isCheckoutDirty, isGitRepository, isWorktreeDirty, mergeBaseOf, mergeBranch, removeWorktree, runGit } from "./team-git.js";
 import { matchesAnyScope } from "./team-write-policy.js";
@@ -393,6 +394,70 @@ export class TeamManager {
         error: errorMessage(error),
       });
     }
+  }
+
+  /**
+   * rewind 团队重置广播（M3，O8 另半边）：lead rewind 已由 runtime 停掉 removed-turn 的
+   * 成员任务并 bump branchGeneration（迟到回话被挡）。这里的重置 = 通知而非回滚：
+   * 运行中成员 steer 一条「lead 已 rewind，看板为准」；已停成员信箱留在途通知（下次
+   * 唤醒补送，不花钱自动复活）；lead 信箱留一条回执（轮询注入）。任务不强制释放——
+   * 被打断成员的 in_progress 由 collect 入口的清扫决定归还。
+   */
+  async resetTeamAfterRewind(): Promise<void> {
+    if (!this.active) return;
+    const notice =
+      "Team reset: the lead rewound its conversation to an earlier point. The task board remains authoritative — re-sync with task_list before assuming anything the lead said earlier still holds.";
+    let steered = 0;
+    let queued = 0;
+    for (const member of this.roster) {
+      if (member.state === "spawning") continue;
+      let running = false;
+      if (member.agentId !== undefined && this.memberControl) {
+        try {
+          running = (await this.memberControl.getAgentStatus(member.agentId)) === "running";
+        } catch {
+          running = false;
+        }
+      }
+      if (running) {
+        const delivered = await this.route("lead", member.name, {
+          summary: "team reset after lead rewind",
+          message: notice,
+          trace: { traceId: createTraceId(), spanId: "team-reset" },
+        });
+        if (delivered.status === "success") {
+          steered += 1;
+          continue;
+        }
+        // route() 先写后投递：投递失败时通知已在成员信箱（在途，下次唤醒补送），
+        // 不再重复入箱——配额拒绝等写前失败的极端情况少一条通知，可接受。
+        queued += 1;
+        continue;
+      }
+      await this.enqueueInbox(member.name, {
+        messageId: `teammsg_${randomUUID()}`,
+        from: "lead",
+        to: member.name,
+        summary: "team reset after lead rewind",
+        message: notice,
+        queuedAt: new Date().toISOString(),
+      });
+      queued += 1;
+    }
+    await this.enqueueInbox("lead", {
+      messageId: `teammsg_${randomUUID()}`,
+      from: "lead",
+      to: "lead",
+      summary: "team reset broadcast issued",
+      message: `Team reset after rewind: ${steered} running teammate(s) steered, ${queued} offline teammate(s) queued for next wake.`,
+      queuedAt: new Date().toISOString(),
+    });
+    this.logger?.info?.("Team reset broadcast after rewind", {
+      module: "core.agent.team",
+      team: this.active.name,
+      steered,
+      queued,
+    });
   }
 
   async reserveMember(registration: TeamMemberRegistration): Promise<TeamRosterResult> {
@@ -1682,6 +1747,7 @@ export function createLeadTeamPort(manager: TeamManager): LeadTeamPort {
     readMemberPendingMessages: (memberName) => manager.readMemberPendingMessages(memberName),
     markMemberMessagesDelivered: (memberName, messageIds) =>
       manager.markMemberMessagesDelivered(memberName, messageIds),
+    resetTeamAfterRewind: () => manager.resetTeamAfterRewind(),
   };
 }
 

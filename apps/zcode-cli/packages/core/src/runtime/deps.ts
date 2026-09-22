@@ -47,6 +47,7 @@ export {
   CoreErrorType,
   EventReducer,
   HookEventName,
+  isLeadTeamPort,
   ModelErrorCode,
   RewindScope,
   RewindStrategy,

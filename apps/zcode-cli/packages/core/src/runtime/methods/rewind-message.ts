@@ -8,6 +8,7 @@ import {
   evaluateRewindTarget,
   hydrateMessageHistoryFromSession,
   hydrateReadFileStateFromSession,
+  isLeadTeamPort,
   parseWorkspaceCheckpointArtifact,
   selectActiveConversationBranch,
   traceContextToLogContext,
@@ -579,6 +580,18 @@ async function applyConversationRewindPlan(
   });
   this.branchGeneration = branchGeneration;
   this.runtimeTaskRegistry.setActiveBranchGeneration?.(branchGeneration);
+  // Agent Teams O8 另半边（M3）：rewind 提交后广播团队重置——运行中成员 steer 通知，
+  // 已停成员信箱留待补送。fire-and-forget：广播失败只告警，rewind 本身不受影响。
+  if (isLeadTeamPort(this.teamPort)) {
+    void this.teamPort.resetTeamAfterRewind().catch((error) => {
+      this.logger?.warn("Team reset broadcast after rewind failed", {
+        ...traceContextToLogContext(options.traceContext),
+        event: "rewind.team_reset.failed",
+        module: "core.runtime",
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
 
   await rebuildConversationDerivedState.call(this, {
     branchCutAfterMessageId,
