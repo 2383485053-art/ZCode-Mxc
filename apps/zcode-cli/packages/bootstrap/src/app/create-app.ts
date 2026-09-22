@@ -736,6 +736,8 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       sessionId,
       logger,
       configResult.config.team.maxTeammates,
+      // M2 隔离层：lead 仓库根——writer worktree 的创建基点与回收登记处。
+      workingDirectory,
     );
     const teamPort = configResult.config.features.agentTeams
       ? createLeadTeamPort(teamManager)

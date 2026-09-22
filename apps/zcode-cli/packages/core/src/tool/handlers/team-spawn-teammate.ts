@@ -39,6 +39,7 @@ const TEAM_SPAWN_PROVIDER_DESCRIPTION = [
   "```",
   "",
   "Teammates run in the background with a per-run turn budget (default 20). They receive team messages and can message the lead and each other via team_send. Keep teams small (3-5 is the sweet spot).",
+  "Writers (readOnly not set) get their own git worktree (requires a git repository); readOnly teammates share the lead's checkout.",
 ].join("\n");
 
 interface SpawnFailure {
@@ -89,10 +90,37 @@ const teamSpawnTeammateHandler: ToolHandler = async (input, context) => {
     );
   }
 
+  // M2 隔离层：writer 成员先建独立 worktree（readOnly 成员与主 checkout 共存，无树）。
+  // 建树失败（如非 git 仓库）如实回滚占位——不静默降级成共享主 checkout 的 writer。
+  let memberWorkspace: { worktreePath: string; branch: string } | undefined;
+  if (parsed.readOnly !== true) {
+    const workspace = await lead.setupMemberWorkspace(parsed.name);
+    if (workspace.status === "failed" || workspace.workspace === undefined) {
+      const rollback = await lead.removeMember(
+        parsed.name,
+        "workspace setup failed",
+      );
+      return failedOutput(
+        rollback.status === "failed"
+          ? `Teammate workspace setup failed and rollback also failed; remove '${parsed.name}' manually. Cause: ${workspace.error ?? workspace.message}`
+          : `Teammate spawn rolled back: ${workspace.error ?? workspace.message}`,
+      );
+    }
+    memberWorkspace = workspace.workspace;
+  }
+
   const briefing = [
     `You are teammate "${parsed.name}" on agent team "${reserve.teamName}".`,
     'Your lead is "lead". Task assignments and messages arrive as team messages; answer or report with team_send.',
     "Work comes from the shared board: task_list shows it; claim an unowned pending task with task_update status=in_progress, finish it with task_update status=completed (the reply names the next claimable task), and pick that up before stopping.",
+    ...(memberWorkspace !== undefined
+      ? [
+          `You work in your own git worktree (${memberWorkspace.branch} at ${memberWorkspace.worktreePath}); your cwd is already there — use relative paths.`,
+          "File writes are limited to your current task's scope; out-of-scope or outside-worktree writes are rejected. Do not run git commit/branch yourself — completing a task commits your worktree automatically, and the lead merges your branch.",
+        ]
+      : [
+          "You have no separate worktree and share the lead's checkout: prefer read-only analysis (read/search/list) and report findings via team_send — direct edits would land unisolated in the shared checkout.",
+        ]),
     "Teammates are resumed per message: finish your current instructions cleanly and stop; you will be woken when there is more to do.",
   ].join("\n");
 
@@ -105,8 +133,9 @@ const teamSpawnTeammateHandler: ToolHandler = async (input, context) => {
         agentType: parsed.profile,
         description: `Team ${reserve.teamName} member ${parsed.name}`,
         prompt: briefing,
-        workingDirectory: context.workingDirectory,
-        workspaceRoot: context.workspaceRoot,
+        // writer 的 cwd/workspaceRoot 都指向自己的 worktree：相对路径天然落树内。
+        workingDirectory: memberWorkspace?.worktreePath ?? context.workingDirectory,
+        workspaceRoot: memberWorkspace?.worktreePath ?? context.workspaceRoot,
         trace: resolveToolTraceContext(context),
         teamMemberName: parsed.name,
         ...(parsed.maxTurns === undefined ? {} : { maxTurns: parsed.maxTurns }),

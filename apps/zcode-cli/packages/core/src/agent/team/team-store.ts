@@ -12,6 +12,9 @@ import {
 
 const ARCHIVE_DIR_NAME = ".archive";
 const TEAM_SUBDIRS = ["inboxes", "contracts", "worklogs"] as const;
+/** Windows 上成员子进程/git 句柄异步释放，归档 rename 可能首试 EBUSY/EPERM——重试即过。 */
+const ARCHIVE_RENAME_RETRIES = 3;
+const ARCHIVE_RETRY_DELAY_MS = 300;
 
 export class TeamStoreError extends Error {
   constructor(
@@ -154,21 +157,38 @@ export class TeamStore {
     await writeFile(path, `${JSON.stringify(inbox, null, 2)}\n`, "utf8");
   }
 
+  /**
+   * worklog 落盘（M2 兑现 createTask 写下的路径承诺）：任务终态时写骨架，
+   * best-effort——调用方（TeamManager）只告警不阻断。
+   */
+  async writeWorklog(teamName: string, taskId: string, content: string): Promise<void> {
+    const { teamDir } = this.location(teamName);
+    await writeFile(join(teamDir, "worklogs", `${taskId}.md`), content, "utf8");
+  }
+
   /** 归档即删除（设计 2.5 第 4 步）：移出活跃命名空间，完整保留在 .archive/ 供事后排查。 */
   async archiveTeam(teamName: string): Promise<string> {
     const { teamDir } = this.location(teamName);
     const archiveRoot = join(this.teamsRoot, ARCHIVE_DIR_NAME);
     await mkdir(archiveRoot, { recursive: true });
     const archivedPath = join(archiveRoot, `${teamName}-${Date.now()}`);
-    try {
-      await rename(teamDir, archivedPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        throw new TeamStoreError(`Team '${teamName}' not found`, "not_found", error);
+    let lastError: unknown;
+    for (let attempt = 0; attempt < ARCHIVE_RENAME_RETRIES; attempt++) {
+      try {
+        await rename(teamDir, archivedPath);
+        return archivedPath;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          throw new TeamStoreError(`Team '${teamName}' not found`, "not_found", error);
+        }
+        lastError = error;
+        // EBUSY/EPERM/ENOTEMPTY 类句柄未释放：短暂等待后重试（真机验收遗留①）。
+        if (attempt < ARCHIVE_RENAME_RETRIES - 1) {
+          await new Promise((resolve) => setTimeout(resolve, ARCHIVE_RETRY_DELAY_MS));
+        }
       }
-      throw new TeamStoreError(`Cannot archive ${teamDir}`, "io_error", error);
     }
-    return archivedPath;
+    throw new TeamStoreError(`Cannot archive ${teamDir}`, "io_error", lastError);
   }
 
   /** 兜底清理：归档意外失败时的最后手段，直接删除。 */

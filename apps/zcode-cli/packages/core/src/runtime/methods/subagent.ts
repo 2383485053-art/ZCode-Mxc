@@ -1,6 +1,10 @@
 /* eslint-disable max-lines -- subagent runtime wiring 集中衔接 child runtime、tool pool、权限、MCP 与 activity watchdog，拆分需单独迁移。 */
 import { isLeadTeamPort, RESPOND_TO_COORDINATOR_TOOL_NAME } from "@zcode/contracts";
 import { getTeamExecutionGate } from "../../agent/team/team-execution-gate.js";
+import {
+  createMemberWritePolicyProvider,
+  createTeamFileSystemGate,
+} from "../../agent/team/team-write-policy.js";
 import type { SubagentRunOptions } from "@zcode/contracts";
 import {
   defaultScheduler,
@@ -333,7 +337,18 @@ export function createDefaultSubagentPort(
             isLeadTeamPort(deps.teamPort)
               ? getTeamExecutionGate(deps.teamPort, deps.executionPort)
               : deps.executionPort,
-          fileSystemPort: deps.fileSystemPort,
+          // Agent Teams M2 隔离层（设计 2.6）：成员 child 的文件写过写策略 gate——
+          // worktree 边界 + 当前任务 scope，越界硬 veto 带指引。readOnly 成员/普通
+          // spawn 的 policy.worktreePath 缺席，gate 透传，行为不变。
+          fileSystemPort:
+            request.teamMemberName !== undefined &&
+            deps.fileSystemPort !== undefined &&
+            isLeadTeamPort(deps.teamPort)
+              ? createTeamFileSystemGate(
+                  deps.fileSystemPort,
+                  createMemberWritePolicyProvider(deps.teamPort, request.teamMemberName),
+                )
+              : deps.fileSystemPort,
           // Explore 子运行时会暴露 WebFetch，但之前没有继承主 runtime 的
           // HTTP client port，导致工具在真正发请求前抛出配置错误，而不是网络请求失败。
           httpClientPort: deps.httpClientPort,

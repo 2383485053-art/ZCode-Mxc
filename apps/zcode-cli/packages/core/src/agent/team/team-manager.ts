@@ -2,6 +2,7 @@
    单 writer 单进程的 M1 边界先在这里稳定（roster/看板/投递共享同一份内存真相与落盘节奏），
    M2/M3 引入跨进程与 hooks 时再按职责拆分。 */
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import type {
   LeadTeamPort,
   Logger,
@@ -15,6 +16,8 @@ import type {
   TeamMember,
   TeamMemberControlTarget,
   TeamMemberRegistration,
+  TeamMemberWorkspaceResult,
+  TeamMemberWritePolicy,
   TeamPort,
   TeamRosterResult,
   TeamSendResult,
@@ -33,6 +36,7 @@ import {
   TEAM_COLLECT_MAX_TIMEOUT_MS,
   TEAM_COLLECT_MIN_TIMEOUT_MS,
 } from "@zcode/contracts";
+import { commitAll, createWorktree, isGitRepository, removeWorktree, runGit } from "./team-git.js";
 import { isPidAlive, TeamStore, TeamStoreError } from "./team-store.js";
 
 /** 成员默认上限（设计 2.3 的 3-5 甜点）；settings 键 team.maxTeammates 随治理层 PR 接入。 */
@@ -47,6 +51,23 @@ function isTaskTerminal(status: TeamTask["status"]): boolean {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * scope 相交判定的保守近似：glob 截到首个通配段得路径前缀（src/auth/** →
+ * src/auth），前缀相等或互为目录祖先即视为重叠。docs/*.md vs docs/*.txt 会被
+ * 误报相交——宁可误报（lead 调整 scope）不可漏报（并行 writer 互相踩）。
+ */
+function scopesOverlap(a: string, b: string): boolean {
+  const pa = scopePrefix(a);
+  const pb = scopePrefix(b);
+  if (pa === "" || pb === "") return true;
+  return pa === pb || pa.startsWith(`${pb}/`) || pb.startsWith(`${pa}/`);
+}
+
+function scopePrefix(glob: string): string {
+  const idx = glob.search(/[*?]/);
+  return (idx === -1 ? glob : glob.slice(0, idx)).replace(/\/+$/, "");
 }
 
 /**
@@ -80,6 +101,8 @@ export class TeamManager {
     private readonly leadSessionId: string,
     private readonly logger?: Logger,
     private readonly maxTeammates: number = DEFAULT_MAX_TEAMMATES,
+    /** lead 的仓库根（M2 隔离层）：writer worktree 的创建基点与回收登记处。 */
+    private readonly workspaceRoot: string = process.cwd(),
   ) {}
 
   /** 装配期挂投递钩子（bootstrap 在 AgentRuntime 构造后回填 lead 侧 subagent 端口）。 */
@@ -111,6 +134,9 @@ export class TeamManager {
           );
         }
         await this.store.archiveTeam(name);
+        // 被归档团队名下可能带着未回收的 worktree：目录随团队一起移进 .archive 后，
+        // git 侧登记悬挂，prune 清掉（分支与归档副本保留，事后仍可抢救）。
+        await runGit(this.workspaceRoot, ["worktree", "prune"]);
         this.logger?.info?.("Archived stale team during createTeam", {
           module: "core.agent.team",
           staleTeam: name,
@@ -185,6 +211,7 @@ export class TeamManager {
         }
       }
       await this.store.archiveTeam(name);
+      await runGit(this.workspaceRoot, ["worktree", "prune"]);
       this.active = undefined;
       this.roster = [];
       this.tasks = [];
@@ -268,6 +295,20 @@ export class TeamManager {
     if (!member || !this.active) {
       return rosterFailed(`Teammate '${memberName}' is not on the roster.`);
     }
+    // M2：先回收 worktree（成员的独立树随除名消失，分支留待 lead merge 或丢弃）。
+    // 回收失败不阻断除名——残留树是磁盘垃圾不是正确性问题，prune 后续可清。
+    if (member.worktreePath !== undefined) {
+      const removed = await removeWorktree(this.workspaceRoot, member.worktreePath);
+      if (!removed.ok) {
+        this.logger?.warn?.("Team worktree removal failed; left for manual cleanup", {
+          module: "core.agent.team",
+          team: this.active.name,
+          member: member.name,
+          worktreePath: member.worktreePath,
+          error: removed.error,
+        });
+      }
+    }
     this.roster = this.roster.filter((entry) => entry.name !== memberName);
     const persistError = await this.persistRoster();
     if (persistError) {
@@ -303,6 +344,109 @@ export class TeamManager {
       }
     }
     return released;
+  }
+
+  // ============================================================
+  // 隔离层（M2，设计 2.6）：writer worktree + 写策略
+  // ============================================================
+
+  /**
+   * writer 成员 spawn 前建独立 worktree + 分支（基于 lead 仓库当前 HEAD）。
+   * 树放在团队目录下（worktrees/{member}），随团队生命周期回收。非 git 仓库、
+   * git 失败均如实返回，调用方（spawn handler）回滚 roster 占位。
+   */
+  async setupMemberWorkspace(memberName: string): Promise<TeamMemberWorkspaceResult> {
+    if (!this.active) {
+      return workspaceFailed("No active team. Create a team first with team_create.");
+    }
+    const member = this.roster.find((entry) => entry.name === memberName);
+    if (!member) {
+      return workspaceFailed(`Teammate '${memberName}' is not on the roster.`);
+    }
+    if (member.worktreePath !== undefined) {
+      return workspaceFailed(`Teammate '${memberName}' already has a worktree.`);
+    }
+    if (!(await isGitRepository(this.workspaceRoot))) {
+      return workspaceFailed(
+        `Writer teammates need a git repository at '${this.workspaceRoot}'. ` +
+          "Spawn readOnly teammates in non-git projects, or git init first.",
+      );
+    }
+    const worktreePath = join(
+      this.store.location(this.active.name).teamDir,
+      "worktrees",
+      memberName,
+    );
+    const branch = `zcode-team/${this.active.name}/${memberName}`;
+    const created = await createWorktree(this.workspaceRoot, worktreePath, branch);
+    if (!created.ok) {
+      return workspaceFailed(created.error);
+    }
+    member.worktreePath = worktreePath;
+    const persistError = await this.persistRoster();
+    if (persistError) {
+      // 落盘失败回滚半成品树，roster 留在调用方的 removeMember 兜底里。
+      member.worktreePath = undefined;
+      const undone = await removeWorktree(this.workspaceRoot, worktreePath);
+      return workspaceFailed(
+        `Teammate workspace could not be persisted: ${persistError}` +
+          (undone.ok ? "" : " (worktree left behind; manual cleanup needed)"),
+      );
+    }
+    this.logger?.info?.("Team member worktree created", {
+      module: "core.agent.team",
+      team: this.active.name,
+      member: memberName,
+      worktreePath,
+      branch,
+    });
+    return {
+      status: "success",
+      workspace: { worktreePath, branch },
+      message: `Worktree '${branch}' ready at ${worktreePath}.`,
+    };
+  }
+
+  /** 写策略快照（注入缝 veto 用）：树边界 spawn 期定死，scope 随认领动态取。 */
+  getMemberWritePolicy(memberName: string): TeamMemberWritePolicy {
+    const member = this.roster.find((entry) => entry.name === memberName);
+    if (member === undefined || member.worktreePath === undefined) return {};
+    const held = this.tasks.find(
+      (task) => task.owner === memberName && task.status === "in_progress",
+    );
+    return {
+      worktreePath: member.worktreePath,
+      ...(held?.scope !== undefined && held.scope.length > 0 ? { scope: [...held.scope] } : {}),
+    };
+  }
+
+  /**
+   * worklog 落盘（M2 兑现 M1 的路径承诺，真机验收遗留②）：任务终态时写骨架。
+   * best-effort——失败告警不阻断完成应答。
+   */
+  private async writeWorklog(task: TeamTask): Promise<void> {
+    if (!this.active || task.worklog === undefined) return;
+    const lines = [
+      `# Task #${task.id}: ${task.subject}`,
+      "",
+      `- status: ${task.status}`,
+      `- owner: ${task.owner ?? "(none)"}`,
+      ...(task.scope !== undefined ? [`- scope: ${task.scope.join(", ")}`] : []),
+      `- created: ${task.createdAt}`,
+      `- updated: ${task.updatedAt}`,
+      "",
+      ...(task.description !== undefined ? ["## Description", "", task.description, ""] : []),
+    ];
+    try {
+      await this.store.writeWorklog(this.active.name, task.id, `${lines.join("\n")}\n`);
+    } catch (error) {
+      this.logger?.warn?.("Team worklog write failed", {
+        module: "core.agent.team",
+        team: this.active.name,
+        taskId: task.id,
+        error: errorMessage(error),
+      });
+    }
   }
 
   /**
@@ -408,6 +552,22 @@ export class TeamManager {
     if (missing.length > 0) {
       return taskFailed(`Unknown task id(s) in blocked_by: ${missing.join(", ")}.`);
     }
+    // M2 scope 不相交断言（设计 2.6「plan 时断言，重叠报错给 lead」）：与全部
+    // 未终态任务的 scope 两两判交；保守近似（通配前缀祖先判定），宁可误报不可漏报。
+    if (request.scope !== undefined && request.scope.length > 0) {
+      for (const existing of this.tasks) {
+        if (isTaskTerminal(existing.status) || existing.scope === undefined) continue;
+        const overlap = request.scope.find((glob) =>
+          existing.scope!.some((other) => scopesOverlap(glob, other)),
+        );
+        if (overlap !== undefined) {
+          return taskFailed(
+            `Scope '${overlap}' overlaps with task #${existing.id} scope [${existing.scope.join(", ")}]. ` +
+              "Parallel writers must not intersect; finish the other task first or split the scopes.",
+          );
+        }
+      }
+    }
     const id = String(this.nextTaskId++);
     const now = new Date().toISOString();
     const task: TeamTask = {
@@ -419,6 +579,9 @@ export class TeamManager {
       blockedBy: [...(request.blockedBy ?? [])],
       ...(request.sharedContext !== undefined && request.sharedContext.length > 0
         ? { sharedContext: [...request.sharedContext] }
+        : {}),
+      ...(request.scope !== undefined && request.scope.length > 0
+        ? { scope: [...request.scope] }
         : {}),
       worklog: `worklogs/${id}.md`,
       createdAt: now,
@@ -521,6 +684,25 @@ export class TeamManager {
       };
     }
 
+    // M2 隔离层：writer 完成任务 = 系统代提交其 worktree（成员不用管 git），
+    // commit 失败如实中断——任务留 in_progress，成员修好状态再完成。
+    if (request.status === "completed" && before.status !== "completed") {
+      const owner = ownerToSet ?? task.owner;
+      const member = owner === undefined ? undefined : this.roster.find((m) => m.name === owner);
+      if (member?.worktreePath !== undefined) {
+        const committed = await commitAll(
+          member.worktreePath,
+          `team: task #${task.id} ${task.subject}`,
+        );
+        if (!committed.ok) {
+          return taskFailed(
+            `Task #${task.id} cannot be completed: ${committed.error}. ` +
+              "The worktree state is left as-is; resolve git (e.g. identity config) and complete again.",
+          );
+        }
+      }
+    }
+
     if (ownerToSet !== undefined) task.owner = ownerToSet;
     if (claimOwner !== undefined) task.owner = claimOwner;
     if (request.status !== undefined && request.status !== before.status) {
@@ -531,6 +713,9 @@ export class TeamManager {
       task.owner = undefined;
     }
     task.updatedAt = new Date().toISOString();
+    if (isTaskTerminal(task.status)) {
+      await this.writeWorklog(task);
+    }
     await this.persistBoard();
     return {
       status: "success",
@@ -822,6 +1007,8 @@ export function createLeadTeamPort(manager: TeamManager): LeadTeamPort {
     completeMemberSpawn: (memberName, agent) => manager.completeMemberSpawn(memberName, agent),
     removeMember: (memberName, reason) => manager.removeMember(memberName, reason),
     createMemberPort: (memberName) => createMemberTeamPort(manager, memberName),
+    setupMemberWorkspace: (memberName) => manager.setupMemberWorkspace(memberName),
+    getMemberWritePolicy: (memberName) => manager.getMemberWritePolicy(memberName),
     createTask: (request) => manager.createTask(request),
     collectTasks: (request, signal) => manager.collectTasks(request, signal),
   };
@@ -849,6 +1036,10 @@ function rosterFailed(reason: string, memberName?: string): TeamRosterResult {
     message: reason,
     error: reason,
   };
+}
+
+function workspaceFailed(reason: string): TeamMemberWorkspaceResult {
+  return { status: "failed", message: reason, error: reason };
 }
 
 function sendFailed(messageId: string, reason: string): TeamSendResult {

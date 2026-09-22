@@ -34,6 +34,8 @@ export const TEAM_MEMBER_SCHEMA = z.object({
   readOnly: z.boolean().optional(),
   maxTurns: z.number().int().positive().optional(),
   state: TEAM_MEMBER_STATE_SCHEMA,
+  // M2 隔离层：writer 成员的独立 worktree（绝对路径）；readOnly 成员/普通 spawn 缺席。
+  worktreePath: z.string().min(1).optional(),
 });
 export type TeamMember = z.infer<typeof TEAM_MEMBER_SCHEMA>;
 
@@ -93,6 +95,9 @@ export const TEAM_TASK_SCHEMA = z.object({
   owner: z.string().optional(),
   sharedContext: z.array(z.string()).optional(),
   worklog: z.string().optional(),
+  // M2 隔离层：写范围 globs（仓库相对，如 src/auth/**）。带 scope 的任务受运行时
+  // veto + merge gate 双重约束；创建时与未终态任务的 scope 做不相交断言。
+  scope: z.array(z.string().min(1)).optional(),
   blocks: z.array(z.string().min(1)).optional(),
   createdAt: z.string().min(1),
   updatedAt: z.string().min(1),
@@ -113,6 +118,7 @@ export interface TeamTaskCreateRequest {
   activeForm?: string;
   blockedBy?: string[];
   sharedContext?: string[];
+  scope?: string[];
 }
 
 export interface TeamTaskCreateResult {
@@ -282,6 +288,30 @@ export interface TeamRosterResult {
   error?: string;
 }
 
+/** M2 隔离层：writer 成员的独立工作区（git worktree + 独立分支）。 */
+export interface TeamMemberWorkspace {
+  worktreePath: string;
+  branch: string;
+}
+
+export interface TeamMemberWorkspaceResult {
+  status: "success" | "failed";
+  workspace?: TeamMemberWorkspace;
+  message: string;
+  error?: string;
+}
+
+/**
+ * 写策略快照（注入缝 veto 用）：worktreePath 缺席 = 该成员不设防（readOnly/普通
+ * spawn）；scope 是该成员当前 in_progress 任务的写范围，缺席 = 树内不限（merge
+ * gate 的 out-of-scope 断言兜底）。同步查询——scope 随认领动态变化，gate 在
+ * 每次文件写工具调用时取最新值。
+ */
+export interface TeamMemberWritePolicy {
+  worktreePath?: string;
+  scope?: string[];
+}
+
 export interface LeadTeamPort extends TeamPort {
   createTeam(request: TeamCreateRequest): Promise<TeamCreateResult>;
   deleteTeam(request: TeamDeleteRequest): Promise<TeamDeleteResult>;
@@ -296,6 +326,16 @@ export interface LeadTeamPort extends TeamPort {
    * 只有 lead 句柄实现——成员端口永远不满足 isLeadTeamPort。
    */
   createMemberPort(memberName: string): TeamPort;
+  /**
+   * M2 隔离层：writer 成员 spawn 前建独立 worktree + 分支（readOnly 成员跳过，
+   * 调用方决定）。失败返回原因（如非 git 仓库），调用方回滚 roster 占位。
+   */
+  setupMemberWorkspace(memberName: string): Promise<TeamMemberWorkspaceResult>;
+  /**
+   * 写策略查询（注入缝的 fileSystemPort gate 用）：同步快照，scope 随成员当前
+   * in_progress 任务动态变化。成员不在名册时返回空对象 = 不设防。
+   */
+  getMemberWritePolicy(memberName: string): TeamMemberWritePolicy;
   /** 建任务（ACL：仅 lead；成员经 updateTask 认领）。 */
   createTask(request: TeamTaskCreateRequest): Promise<TeamTaskCreateResult>;
   /** 合流等待（ACL：仅 lead；等非终态任务到达终态，超时带部分结果）。 */
