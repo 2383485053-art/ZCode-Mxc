@@ -21,6 +21,7 @@ import {
   TEAM_COLLECT_TOOL_NAME,
   TEAM_CREATE_TOOL_NAME,
   TEAM_DELETE_TOOL_NAME,
+  TEAM_MERGE_TOOL_NAME,
   TEAM_SEND_TOOL_NAME,
   TEAM_SPAWN_TEAMMATE_TOOL_NAME,
   type JsonSchema,
@@ -70,6 +71,7 @@ import { taskListToolEntry } from "./task-list.js";
 import { taskQueryToolEntry } from "./task-query.js";
 import { taskUpdateToolEntry } from "./task-update.js";
 import { teamCollectToolEntry } from "./team-collect.js";
+import { teamMergeToolEntry } from "./team-merge.js";
 import { createSubmitResultToolEntry, submitResultToolEntry } from "./submit-result.js";
 import { escalateToolEntry } from "./escalate.js";
 import { resolveWorkflowQuestionToolEntry } from "./resolve-workflow-question.js";
@@ -121,6 +123,7 @@ export const builtInTools: ToolEntry[] = [
   teamSpawnTeammateToolEntry,
   taskCreateToolEntry,
   teamCollectToolEntry,
+  teamMergeToolEntry,
   // 看板读写：成员窄面端口也能满足（ACL 由 TeamManager 按 caller 身份执行），同 team_send 门。
   taskListToolEntry,
   taskQueryToolEntry,
@@ -193,7 +196,7 @@ interface RegisterBuiltInToolsOptions {
   includeRespondToCoordinator?: boolean;
   /** 团队协作工具（team_send + 看板读写）；注入了 TeamPort 的会话（lead 或团队成员）才注册。 */
   includeTeamTools?: boolean;
-  /** 团队生命周期与看板管理（team_create/team_delete/team_spawn_teammate/task_create/team_collect）；仅 lead 句柄注册。 */
+  /** 团队生命周期与看板管理（team_create/team_delete/team_spawn_teammate/task_create/team_collect/team_merge）；仅 lead 句柄注册。 */
   includeTeamAdmin?: boolean;
   includeSubmitResult?: boolean;
   /**
@@ -279,7 +282,8 @@ export function registerBuiltInTools(
         entry.metadata.name === TEAM_DELETE_TOOL_NAME ||
         entry.metadata.name === TEAM_SPAWN_TEAMMATE_TOOL_NAME ||
         entry.metadata.name === TASK_CREATE_TOOL_NAME ||
-        entry.metadata.name === TEAM_COLLECT_TOOL_NAME) &&
+        entry.metadata.name === TEAM_COLLECT_TOOL_NAME ||
+        entry.metadata.name === TEAM_MERGE_TOOL_NAME) &&
       options.includeTeamAdmin !== true
     ) {
       continue;

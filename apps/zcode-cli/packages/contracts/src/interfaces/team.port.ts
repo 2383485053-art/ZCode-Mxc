@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { SubagentSendMessageResult } from "./subagent.port.js";
+import type { TeamMergeRejection } from "../tools/team-merge.js";
 import type { TraceContext } from "../tracing/tracer.js";
 
 // ============================================================
@@ -98,6 +99,8 @@ export const TEAM_TASK_SCHEMA = z.object({
   // M2 隔离层：写范围 globs（仓库相对，如 src/auth/**）。带 scope 的任务受运行时
   // veto + merge gate 双重约束；创建时与未终态任务的 scope 做不相交断言。
   scope: z.array(z.string().min(1)).optional(),
+  // M2 merge gate：mergeTask 成功时间戳；缺席 = 尚未合入主 checkout。
+  mergedAt: z.string().min(1).optional(),
   blocks: z.array(z.string().min(1)).optional(),
   createdAt: z.string().min(1),
   updatedAt: z.string().min(1),
@@ -174,6 +177,25 @@ export interface TeamCollectRequest {
 export interface TeamCollectResult {
   status: "completed" | "partial" | "timeout" | "failed";
   tasks: TeamTask[];
+  message: string;
+  error?: string;
+  /** M2 冲突检测（设计 2.6 O1）：未 merge 的 completed 任务其 owner 分支间的 diff 文件
+   *  重叠预警——合并前发现两个成员改了同一处，merge 顺序需要 lead 裁决。 */
+  mergeWarnings?: string[];
+}
+
+/** merge gate 入参（设计 2.6）：merge 的是任务 owner 的分支；七类机械断言见 TeamMergeResult。 */
+export interface TeamMergeRequest {
+  taskId: string;
+}
+
+export interface TeamMergeResult {
+  status: "success" | "failed";
+  taskId?: string;
+  task?: TeamTask;
+  /** 拒绝机器码（七类之一）；成功时缺席。 */
+  rejection?: TeamMergeRejection;
+  mergedFiles?: string[];
   message: string;
   error?: string;
 }
@@ -338,6 +360,8 @@ export interface LeadTeamPort extends TeamPort {
   getMemberWritePolicy(memberName: string): TeamMemberWritePolicy;
   /** 建任务（ACL：仅 lead；成员经 updateTask 认领）。 */
   createTask(request: TeamTaskCreateRequest): Promise<TeamTaskCreateResult>;
+  /** merge gate（M2，设计 2.6）：把 completed 任务的 owner 分支合入主 checkout，七类机械断言。 */
+  mergeTask(request: TeamMergeRequest): Promise<TeamMergeResult>;
   /** 合流等待（ACL：仅 lead；等非终态任务到达终态，超时带部分结果）。 */
   collectTasks(request: TeamCollectRequest, signal?: AbortSignal): Promise<TeamCollectResult>;
 }

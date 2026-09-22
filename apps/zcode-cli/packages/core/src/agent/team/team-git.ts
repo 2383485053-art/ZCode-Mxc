@@ -120,3 +120,76 @@ export async function removeWorktree(
   }
   return { ok: false, error: lastError };
 }
+
+// ============================================================
+// merge gate（M2 PR8）
+// ============================================================
+
+/** 两分支的 merge-base（在 repoRoot 跑，HEAD 即主 checkout 当前分支）。 */
+export async function mergeBaseOf(
+  repoRoot: string,
+  branch: string,
+): Promise<{ ok: true; base: string } | { ok: false; error: string }> {
+  const result = await runGit(repoRoot, ["merge-base", "HEAD", branch]);
+  return result.ok
+    ? { ok: true, base: result.stdout.trim() }
+    : { ok: false, error: describeGitFailure(result, "git merge-base failed") };
+}
+
+/** 分支相对 base 的改动文件集（仓库相对路径，\n 分隔）。 */
+export async function diffFiles(
+  repoRoot: string,
+  base: string,
+  branch: string,
+): Promise<{ ok: true; files: string[] } | { ok: false; error: string }> {
+  const result = await runGit(repoRoot, ["diff", "--name-only", `${base}...${branch}`]);
+  return result.ok
+    ? {
+        ok: true,
+        files: result.stdout
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0),
+      }
+    : { ok: false, error: describeGitFailure(result, "git diff failed") };
+}
+
+/** 主 checkout 脏检查（lead 自己的未提交改动会让 merge 无法收场）。 */
+export async function isCheckoutDirty(repoRoot: string): Promise<boolean> {
+  const result = await runGit(repoRoot, ["status", "--porcelain"]);
+  return result.ok && result.stdout.trim().length > 0;
+}
+
+/**
+ * merge 成员分支进主 checkout 当前分支。冲突即 abort 回滚（worktree 复位，
+ * 设计 2.6 O8 的 merge 失败半边）并如实报错——main 停在 merge 前状态。
+ */
+export async function mergeBranch(
+  repoRoot: string,
+  branch: string,
+): Promise<{ ok: true; mergedFiles: string[] } | { ok: false; error: string }> {
+  const merged = await runGit(repoRoot, [
+    "-c",
+    "user.name=zcode-team",
+    "-c",
+    "user.email=team@zcode.local",
+    "merge",
+    "--no-edit",
+    "--no-ff",
+    branch,
+  ]);
+  if (!merged.ok) {
+    await runGit(repoRoot, ["merge", "--abort"]);
+    return { ok: false, error: describeGitFailure(merged, "git merge failed (rolled back)") };
+  }
+  const files = await runGit(repoRoot, ["diff", "--name-only", "HEAD~1..HEAD"]);
+  return {
+    ok: true,
+    mergedFiles: files.ok
+      ? files.stdout
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0)
+      : [],
+  };
+}
