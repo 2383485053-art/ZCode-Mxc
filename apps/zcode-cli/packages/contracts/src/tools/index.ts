@@ -35,6 +35,7 @@ export * from "./task-list.js";
 export * from "./task-query.js";
 export * from "./task-update.js";
 export * from "./team-collect.js";
+export * from "./team-merge.js";
 export * from "./read-session-context.js";
 export * from "./submit-result.js";
 export * from "./websearch.js";

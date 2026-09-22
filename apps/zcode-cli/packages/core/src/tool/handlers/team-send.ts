@@ -24,6 +24,7 @@ const TEAM_SEND_PROVIDER_OUTPUT_SCHEMA = {
     success: { type: "boolean" },
     message: { type: "string" },
     delivery: { type: "string", enum: ["queued", "steered", "resumed_background"] },
+    failed_recipients: { type: "array", items: { type: "string" } },
   },
   required: ["success", "message"],
   additionalProperties: false,
@@ -32,13 +33,13 @@ const TEAM_SEND_PROVIDER_OUTPUT_SCHEMA = {
 const TEAM_SEND_PROVIDER_DESCRIPTION = [
   "# team_send",
   "",
-  "Send a message to a named teammate within the current team.",
+  "Send a message to a named teammate within the current team, or broadcast with \"*\".",
   "",
   "```json",
   '{"to": "reviewer", "summary": "api draft ready", "message": "contracts/team.port.ts is finalized; start your review."}',
   "```",
   "",
-  "Use teammate names as they appear in your team briefing. Messages are delivered by the team router; you do not check an inbox. Continue your current task unless the message changes or ends it.",
+  "Use teammate names as they appear in your team briefing; \"*\" delivers to everyone (lead included, yourself excluded) and reports failed_recipients for anyone who could not receive it. Messages are delivered by the team router; you do not check an inbox. Continue your current task unless the message changes or ends it.",
 ].join("\n");
 
 const teamSendHandler: ToolHandler = async (input, context) => {
@@ -64,11 +65,22 @@ const teamSendHandler: ToolHandler = async (input, context) => {
     );
   }
 
-  return await context.teamPort.send(parsed.to, {
+  const result = await context.teamPort.send(parsed.to, {
     summary: parsed.summary,
     message: parsed.message,
     trace: resolveToolTraceContext(context),
-  }) satisfies TeamSendOutput;
+  });
+  // 工具面字段是 snake_case（failedRecipients → failed_recipients），端口结果整体翻译。
+  return {
+    status: result.status,
+    messageId: result.messageId,
+    message: result.message,
+    ...(result.error !== undefined ? { error: result.error } : {}),
+    ...(result.delivery !== undefined ? { delivery: result.delivery } : {}),
+    ...(result.failedRecipients !== undefined
+      ? { failed_recipients: result.failedRecipients }
+      : {}),
+  } satisfies TeamSendOutput;
 };
 
 export const teamSendToolEntry: ToolEntry = {
@@ -134,15 +146,26 @@ function formatTeamSendModelContent(output: unknown): string {
   const result = TeamSendOutputSchema.parse(output);
   const continuation = "Continue the current task unless the teammate explicitly changed or ended it.";
   if (result.status === "success") {
+    // delivery 枚举词明示进文本（真机验收遗留③：结构化值要进模型可见面）。
     const outcome =
       result.delivery === "resumed_background"
-        ? "The teammate was idle; it was resumed in the background with your message."
+        ? "delivery: resumed_background — the teammate was idle and was resumed in the background with your message."
         : result.delivery === "steered"
-          ? "The message was delivered into the teammate's active turn."
-          : "The message was queued for the teammate.";
-    return `${outcome} ${continuation}`;
+          ? "delivery: steered — the message was delivered into the teammate's active turn."
+          : result.delivery === "queued"
+            ? "delivery: queued — the message was queued for the recipient."
+            : result.message;
+    const broadcastNote =
+      result.failed_recipients !== undefined && result.failed_recipients.length > 0
+        ? ` Broadcast partially failed: ${result.failed_recipients.join(", ")}.`
+        : "";
+    return `${outcome}${broadcastNote} ${continuation}`;
   }
-  return `Message ${result.messageId} failed to send to the teammate. ${continuation} Failure: ${result.error ?? result.message}.`;
+  const failedList =
+    result.failed_recipients !== undefined && result.failed_recipients.length > 0
+      ? ` Failed recipients: ${result.failed_recipients.join(", ")}.`
+      : "";
+  return `Message ${result.messageId} failed to send.${failedList} ${continuation} Failure: ${result.error ?? result.message}.`;
 }
 
 function resolveToolTraceContext(context: Parameters<ToolHandler>[1]): TraceContext {

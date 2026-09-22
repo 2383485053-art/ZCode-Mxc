@@ -12,6 +12,8 @@ export const HookEventName = {
   PostToolUse: "PostToolUse",
   PostToolUseFailure: "PostToolUseFailure",
   Stop: "Stop",
+  TeammateIdle: "TeammateIdle",
+  TaskCompleted: "TaskCompleted",
 } as const;
 
 export type HookEventName = (typeof HookEventName)[keyof typeof HookEventName];
@@ -138,6 +140,25 @@ export interface StopHookInput extends BaseHookInput {
   toolCallCount: number;
 }
 
+/**
+ * Agent Teams hooks（M2，设计 2.7）：通知型——无阻断对象（成员空闲/任务完成都是
+ * 既成事实），stdout/systemMessage 走 HookRunner 通用可见性，additionalContext
+ * 由触发侧丢弃。TeammateIdle 在成员就绪与 collect 扫描发现空闲时触发。
+ */
+export interface TeammateIdleHookInput extends BaseHookInput {
+  hookEventName: typeof HookEventName.TeammateIdle;
+  memberName: string;
+  teamName: string;
+}
+
+export interface TaskCompletedHookInput extends BaseHookInput {
+  hookEventName: typeof HookEventName.TaskCompleted;
+  owner?: string;
+  subject: string;
+  taskId: string;
+  teamName: string;
+}
+
 export type HookInput =
   | PreToolUseHookInput
   | PermissionRequestHookInput
@@ -145,7 +166,9 @@ export type HookInput =
   | PostToolUseFailureHookInput
   | UserPromptSubmitHookInput
   | SessionStartHookInput
-  | StopHookInput;
+  | StopHookInput
+  | TeammateIdleHookInput
+  | TaskCompletedHookInput;
 
 export type PermissionRequestHookDecision =
   | {
@@ -191,6 +214,14 @@ export type HookSpecificOutput =
   | {
       additionalContext?: string;
       hookEventName: typeof HookEventName.Stop;
+    }
+  | {
+      additionalContext?: string;
+      hookEventName: typeof HookEventName.TeammateIdle;
+    }
+  | {
+      additionalContext?: string;
+      hookEventName: typeof HookEventName.TaskCompleted;
     };
 
 export interface HookJSONOutput {
@@ -276,6 +307,14 @@ export const HookSpecificOutputSchema = z.discriminatedUnion("hookEventName", [
   z.object({
     additionalContext: z.string().optional(),
     hookEventName: z.literal(HookEventName.Stop),
+  }),
+  z.object({
+    additionalContext: z.string().optional(),
+    hookEventName: z.literal(HookEventName.TeammateIdle),
+  }),
+  z.object({
+    additionalContext: z.string().optional(),
+    hookEventName: z.literal(HookEventName.TaskCompleted),
   }),
 ]);
 
@@ -417,6 +456,8 @@ export const HooksRuntimeConfigPatchSchema = z.object({
       PostToolUse: z.array(HookMatcherConfigSchema).optional(),
       PostToolUseFailure: z.array(HookMatcherConfigSchema).optional(),
       Stop: z.array(HookMatcherConfigSchema).optional(),
+      TeammateIdle: z.array(HookMatcherConfigSchema).optional(),
+      TaskCompleted: z.array(HookMatcherConfigSchema).optional(),
     })
     .strict()
     .optional(),

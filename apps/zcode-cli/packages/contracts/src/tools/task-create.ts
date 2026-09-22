@@ -28,6 +28,13 @@ export const TaskCreateInputSchema = z
       .max(50)
       .optional()
       .describe("Contract files the assignee should read first (repo-relative paths)."),
+    scope: z
+      .array(z.string().min(1))
+      .max(20)
+      .optional()
+      .describe(
+        "Write-range globs (repo-relative, e.g. ['src/auth/**']). Scoped tasks run inside the writer's own worktree; runtime writes outside scope are vetoed. Scopes of open tasks must not overlap.",
+      ),
   })
   .strict();
 

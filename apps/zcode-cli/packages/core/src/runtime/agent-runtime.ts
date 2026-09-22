@@ -6,6 +6,7 @@ import {
   createToolRegistry,
   defaultPermissionConfig,
   EventReducer,
+  getCurrentTraceContext,
   MessageHistoryImpl,
   PermissionService,
   ToolScheduler,
@@ -64,6 +65,9 @@ import type {
   ContextSourceSnapshot,
   ExecutionShellSelection,
   HookRunner,
+  TaskCompletedHookInput,
+  TeamHookNotification,
+  TeammateIdleHookInput,
   TurnId,
 } from "./deps.js";
 import { installAgentRuntimeMethods } from "./methods/index.js";
@@ -313,6 +317,30 @@ export class AgentRuntime {
    */
   getSubagentPortForTeamDelivery(): SubagentPort | undefined {
     return this.subagentPort;
+  }
+
+  /**
+   * Agent Teams hooks 触发（M2，设计 2.7）：TeamManager 经装配层转发的
+   * TeammateIdle/TaskCompleted 通知。Base 字段（cwd/mode/sessionId/trace）由
+   * runtime 补齐；无 hookRunner（hooks 未启用）时静默跳过——通知型事件不该
+   * 因配置缺席报错。
+   */
+  async runTeamHook(input: TeamHookNotification): Promise<void> {
+    if (this.hookRunner === undefined) return;
+    const traceContext = getCurrentTraceContext() ?? this.rootTraceContext;
+    await this.hookRunner.run(
+      {
+        ...input,
+        agentName: this.config.agentName,
+        cwd: this.workingDirectory,
+        mode: this.getMode(),
+        sessionId: this.sessionId,
+        timestamp: new Date().toISOString(),
+        traceId: traceContext.traceId,
+        ...(traceContext.turnId !== undefined ? { turnId: traceContext.turnId } : {}),
+      } as TeammateIdleHookInput | TaskCompletedHookInput,
+      {},
+    );
   }
 
   async closeBrowserSession(): Promise<void> {

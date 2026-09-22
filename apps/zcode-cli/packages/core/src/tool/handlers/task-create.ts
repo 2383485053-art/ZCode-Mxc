@@ -31,10 +31,11 @@ const TASK_CREATE_PROVIDER_DESCRIPTION = [
   "Create a task on the team board. Lead only.",
   "",
   "```json",
-  '{"subject": "Run the auth test suite", "description": "All tests green; report failures with file:line.", "blocked_by": ["1"]}',
+  '{"subject": "Run the auth test suite", "description": "All tests green; report failures with file:line.", "blocked_by": ["1"], "scope": ["src/auth/**"]}',
   "```",
   "",
   "Subjects are imperative one-liners; description is the acceptance criteria. Teammates claim pending unowned tasks themselves (task_update status=in_progress).",
+  "scope pins the write range: scoped tasks run isolated in the writer's worktree and out-of-scope writes are vetoed; scopes of open tasks must not overlap.",
 ].join("\n");
 
 const taskCreateHandler: ToolHandler = async (input, context) => {
@@ -57,6 +58,7 @@ const taskCreateHandler: ToolHandler = async (input, context) => {
     ...(parsed.active_form !== undefined ? { activeForm: parsed.active_form } : {}),
     ...(parsed.blocked_by !== undefined ? { blockedBy: parsed.blocked_by } : {}),
     ...(parsed.shared_context !== undefined ? { sharedContext: parsed.shared_context } : {}),
+    ...(parsed.scope !== undefined ? { scope: parsed.scope } : {}),
   });
   return {
     status: result.status,

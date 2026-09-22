@@ -1,5 +1,7 @@
 import { z } from "zod";
 import type { SubagentSendMessageResult } from "./subagent.port.js";
+import type { TaskCompletedHookInput, TeammateIdleHookInput } from "../hooks/index.js";
+import type { TeamMergeRejection } from "../tools/team-merge.js";
 import type { TraceContext } from "../tracing/tracer.js";
 
 // ============================================================
@@ -34,6 +36,8 @@ export const TEAM_MEMBER_SCHEMA = z.object({
   readOnly: z.boolean().optional(),
   maxTurns: z.number().int().positive().optional(),
   state: TEAM_MEMBER_STATE_SCHEMA,
+  // M2 隔离层：writer 成员的独立 worktree（绝对路径）；readOnly 成员/普通 spawn 缺席。
+  worktreePath: z.string().min(1).optional(),
 });
 export type TeamMember = z.infer<typeof TEAM_MEMBER_SCHEMA>;
 
@@ -93,6 +97,11 @@ export const TEAM_TASK_SCHEMA = z.object({
   owner: z.string().optional(),
   sharedContext: z.array(z.string()).optional(),
   worklog: z.string().optional(),
+  // M2 隔离层：写范围 globs（仓库相对，如 src/auth/**）。带 scope 的任务受运行时
+  // veto + merge gate 双重约束；创建时与未终态任务的 scope 做不相交断言。
+  scope: z.array(z.string().min(1)).optional(),
+  // M2 merge gate：mergeTask 成功时间戳；缺席 = 尚未合入主 checkout。
+  mergedAt: z.string().min(1).optional(),
   blocks: z.array(z.string().min(1)).optional(),
   createdAt: z.string().min(1),
   updatedAt: z.string().min(1),
@@ -113,6 +122,7 @@ export interface TeamTaskCreateRequest {
   activeForm?: string;
   blockedBy?: string[];
   sharedContext?: string[];
+  scope?: string[];
 }
 
 export interface TeamTaskCreateResult {
@@ -170,6 +180,25 @@ export interface TeamCollectResult {
   tasks: TeamTask[];
   message: string;
   error?: string;
+  /** M2 冲突检测（设计 2.6 O1）：未 merge 的 completed 任务其 owner 分支间的 diff 文件
+   *  重叠预警——合并前发现两个成员改了同一处，merge 顺序需要 lead 裁决。 */
+  mergeWarnings?: string[];
+}
+
+/** merge gate 入参（设计 2.6）：merge 的是任务 owner 的分支；七类机械断言见 TeamMergeResult。 */
+export interface TeamMergeRequest {
+  taskId: string;
+}
+
+export interface TeamMergeResult {
+  status: "success" | "failed";
+  taskId?: string;
+  task?: TeamTask;
+  /** 拒绝机器码（七类之一）；成功时缺席。 */
+  rejection?: TeamMergeRejection;
+  mergedFiles?: string[];
+  message: string;
+  error?: string;
 }
 
 export interface TeamSendMessage {
@@ -191,6 +220,8 @@ export interface TeamSendResult {
   message: string;
   error?: string;
   delivery?: TeamDeliveryState;
+  /** M2 广播（`*`）：逐个投递中失败的收件人（含原因摘要）；全部失败才 status=failed。 */
+  failedRecipients?: string[];
 }
 
 /**
@@ -282,6 +313,50 @@ export interface TeamRosterResult {
   error?: string;
 }
 
+/** M2 隔离层：writer 成员的独立工作区（git worktree + 独立分支）。 */
+export interface TeamMemberWorkspace {
+  worktreePath: string;
+  branch: string;
+}
+
+export interface TeamMemberWorkspaceResult {
+  status: "success" | "failed";
+  workspace?: TeamMemberWorkspace;
+  message: string;
+  error?: string;
+}
+
+/**
+ * 写策略快照（注入缝 veto 用）：worktreePath 缺席 = 该成员不设防（普通
+ * spawn/成员已不在名册）；scope 是该成员当前 in_progress 任务的写范围，缺席 =
+ * 树内不限（merge gate 的 out-of-scope 断言兜底）；readOnly = reviewer 型成员，
+ * 一切文件写被拒（M2 硬化，设计 2.6「reviewer 无 worktree，主 checkout 只读」）。
+ * 同步查询——scope 随认领动态变化，gate 在每次文件写工具调用时取最新值。
+ */
+export interface TeamMemberWritePolicy {
+  worktreePath?: string;
+  scope?: string[];
+  readOnly?: boolean;
+}
+
+/**
+ * 团队 hooks 触发钩子（M2，设计 2.7）：TeamManager 在 TaskCompleted/TeammateIdle
+ * 时机 fire-and-forget 通知；装配层（bootstrap）接到 lead runtime 的 hookRunner，
+ * Base 字段（cwd/mode/sessionId/trace）由 runtime 补齐——hookEventName 与业务
+ * 字段由触发侧携带。
+ * 通知型——hook 失败只告警，不回滚业务变更。
+ */
+export type TeamHookBaseContext =
+  "cwd" | "mode" | "sessionId" | "timestamp" | "traceId" | "turnId" | "agentName";
+
+export type TeamHookNotification =
+  | Omit<TeammateIdleHookInput, TeamHookBaseContext>
+  | Omit<TaskCompletedHookInput, TeamHookBaseContext>;
+
+export interface TeamHookTarget {
+  runTeamHook(input: TeamHookNotification): Promise<void>;
+}
+
 export interface LeadTeamPort extends TeamPort {
   createTeam(request: TeamCreateRequest): Promise<TeamCreateResult>;
   deleteTeam(request: TeamDeleteRequest): Promise<TeamDeleteResult>;
@@ -296,8 +371,20 @@ export interface LeadTeamPort extends TeamPort {
    * 只有 lead 句柄实现——成员端口永远不满足 isLeadTeamPort。
    */
   createMemberPort(memberName: string): TeamPort;
+  /**
+   * M2 隔离层：writer 成员 spawn 前建独立 worktree + 分支（readOnly 成员跳过，
+   * 调用方决定）。失败返回原因（如非 git 仓库），调用方回滚 roster 占位。
+   */
+  setupMemberWorkspace(memberName: string): Promise<TeamMemberWorkspaceResult>;
+  /**
+   * 写策略查询（注入缝的 fileSystemPort gate 用）：同步快照，scope 随成员当前
+   * in_progress 任务动态变化。成员不在名册时返回空对象 = 不设防。
+   */
+  getMemberWritePolicy(memberName: string): TeamMemberWritePolicy;
   /** 建任务（ACL：仅 lead；成员经 updateTask 认领）。 */
   createTask(request: TeamTaskCreateRequest): Promise<TeamTaskCreateResult>;
+  /** merge gate（M2，设计 2.6）：把 completed 任务的 owner 分支合入主 checkout，七类机械断言。 */
+  mergeTask(request: TeamMergeRequest): Promise<TeamMergeResult>;
   /** 合流等待（ACL：仅 lead；等非终态任务到达终态，超时带部分结果）。 */
   collectTasks(request: TeamCollectRequest, signal?: AbortSignal): Promise<TeamCollectResult>;
 }

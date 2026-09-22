@@ -6,7 +6,13 @@ export const TEAM_SEND_MAX_CONTENT_CHARS = 20_000;
 
 export const TeamSendInputSchema = z
   .object({
-    to: z.string().min(1).max(200).describe("Recipient teammate name within the current team."),
+    to: z
+      .string()
+      .min(1)
+      .max(200)
+      .describe(
+        "Recipient teammate name within the current team, or '*' to broadcast to everyone (lead included; excluding yourself).",
+      ),
     summary: z.string().min(1).max(200).describe("A 5-10 word summary shown as a preview."),
     message: z
       .string()
@@ -27,6 +33,7 @@ export const TeamSendOutputSchema = z
     message: z.string(),
     error: z.string().optional(),
     delivery: z.enum(["queued", "steered", "resumed_background"]).optional(),
+    failed_recipients: z.array(z.string()).optional(),
   })
   .strict();
 
