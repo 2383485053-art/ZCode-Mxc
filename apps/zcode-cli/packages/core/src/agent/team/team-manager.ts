@@ -352,11 +352,18 @@ export class TeamManager {
         `Teammate '${to}' cannot receive messages: delivery is unavailable (subagents disabled?).`,
       );
     }
-    const delivered = await this.deliveryTarget.sendMessage(to, {
-      summary: request.summary,
-      message: request.message,
-      trace: request.trace,
-    });
+    // 投递键是 agentId：lead 进程的任务注册表按它索引（成员名仅作镜像/报错身份）。
+    const delivered = await this.deliveryTarget.sendMessage(
+      {
+        memberName: to,
+        ...(toMember?.agentId !== undefined ? { agentId: toMember.agentId } : {}),
+      },
+      {
+        summary: request.summary,
+        message: request.message,
+        trace: request.trace,
+      },
+    );
     if (delivered.status === "failed") {
       return sendFailed(
         messageId,

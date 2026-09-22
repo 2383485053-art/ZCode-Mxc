@@ -194,13 +194,22 @@ export interface TeamSendResult {
 }
 
 /**
+ * 投递目标引用：memberName 供镜像/报错使用；agentId 是 lead 进程子代理任务注册表的
+ * 键——真机 sendMessage 按它查任务，缺席只能如实失败。
+ */
+export interface TeamDeliveryTargetRef {
+  memberName: string;
+  agentId?: string;
+}
+
+/**
  * 投递钩子（通信层下半场）：把已过白名单校验的成员消息送进 lead 进程的子代理任务
  * 注册表（busy→steer，idle→后台复活）。由装配层（bootstrap）铸造成员适配器后挂在
  * TeamManager 上；lead 收件人不走此钩子（主会话无任务可 steer，恒 queued）。
  */
 export interface TeamDeliveryTarget {
   sendMessage(
-    memberName: string,
+    target: TeamDeliveryTargetRef,
     entry: { summary: string; message: string; trace: TraceContext },
   ): Promise<SubagentSendMessageResult>;
 }
