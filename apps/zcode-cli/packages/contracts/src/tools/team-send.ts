@@ -26,6 +26,7 @@ export const TeamSendOutputSchema = z
     messageId: z.string(),
     message: z.string(),
     error: z.string().optional(),
+    delivery: z.enum(["queued", "steered", "resumed_background"]).optional(),
   })
   .strict();
 

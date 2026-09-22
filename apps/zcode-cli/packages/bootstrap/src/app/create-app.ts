@@ -24,6 +24,7 @@ import {
   TeamStore,
   buildPluginReferenceCatalog,
   createLeadTeamPort,
+  createSubagentTeamDelivery,
   type AmendWorkflowRunSettingsInput,
   type ResumeSessionResult,
 } from "@zcode/core";
@@ -788,6 +789,17 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       appVersion,
       traceContext,
     });
+    // Agent Teams 投递（通信层下半场）：lead 侧 subagent 端口是成员任务注册表的所有者，
+    // AgentRuntime 构造后才存在——这里回填给 TeamManager（成员收件 busy→steer / idle→
+    // 后台复活都经它）。端口缺席（subagents 关闭）时不挂，成员投递届时如实失败。
+    if (teamPort) {
+      const leadSubagentPort = runtime.getSubagentPortForTeamDelivery();
+      teamManager.attachDeliveryTarget(
+        leadSubagentPort
+          ? createSubagentTeamDelivery(leadSubagentPort, { sessionId, workingDirectory })
+          : undefined,
+      );
+    }
     markRuntimeConstructed({
       hasInjectedModelAdapter: options.modelAdapter !== undefined,
       sessionId,

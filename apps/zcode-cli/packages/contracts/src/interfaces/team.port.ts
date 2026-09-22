@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { SubagentSendMessageResult } from "./subagent.port.js";
 import type { TraceContext } from "../tracing/tracer.js";
 
 // ============================================================
@@ -72,18 +73,39 @@ export interface TeamSendMessage {
   trace: TraceContext;
 }
 
+/**
+ * 消息结局（设计 2.4：每条消息必有明确结局）。queued = 仅入队（收件人是 lead，
+ * 或成员任务不在场由注册表排队）；steered = 已注入收件成员的活跃 turn；
+ * resumed_background = 成员空闲，已带消息后台复活。
+ */
+export type TeamDeliveryState = "queued" | "steered" | "resumed_background";
+
 export interface TeamSendResult {
   status: "success" | "failed";
   messageId: string;
   message: string;
   error?: string;
+  delivery?: TeamDeliveryState;
+}
+
+/**
+ * 投递钩子（通信层下半场）：把已过白名单校验的成员消息送进 lead 进程的子代理任务
+ * 注册表（busy→steer，idle→后台复活）。由装配层（bootstrap）铸造成员适配器后挂在
+ * TeamManager 上；lead 收件人不走此钩子（主会话无任务可 steer，恒 queued）。
+ */
+export interface TeamDeliveryTarget {
+  sendMessage(
+    memberName: string,
+    entry: { summary: string; message: string; trace: TraceContext },
+  ): Promise<SubagentSendMessageResult>;
 }
 
 export interface TeamPort {
   // 发送方身份由 port closure 绑定（同 CoordinatorResponsePort 纪律），模型不能谎报 from。
   // to 只接受本团队成员名（含 lead），路由层做白名单校验。端口缺席即 team_send 工具不注册，
   // 非团队成员会话不受影响。
-  send(to: string, request: TeamSendMessage): TeamSendResult;
+  // 异步契约：成员收件要等 steer/复活的实际结局才能应答（设计 2.4「明确结局」）。
+  send(to: string, request: TeamSendMessage): Promise<TeamSendResult>;
 }
 
 export interface TeamCreateRequest {

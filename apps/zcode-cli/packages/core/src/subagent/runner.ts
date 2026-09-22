@@ -982,6 +982,8 @@ async function resumeTerminalAgentInBackground(
     workingDirectory: request.workingDirectory,
     workspaceRoot: request.workspaceRoot,
     trace: request.trace,
+    // Agent Teams：成员任务复活必须带回成员名，否则复活的子会话丢 teamPort（注入缝按它铸端口）。
+    ...(task.teamMemberName !== undefined ? { teamMemberName: task.teamMemberName } : {}),
   };
   const lifecycle = createSubagentLifecycleFromTask(options, resumeRequest, profile, task);
   if (!lifecycle) {
@@ -1469,6 +1471,10 @@ function createRuntimeTaskSnapshot(input: {
     prompt: input.request.prompt,
     startedAt: input.startedAt,
     status: input.status,
+    // Agent Teams：快照拍平会丢 request，成员名单独留住，sendMessage 复活时靠它重铸 teamPort。
+    ...(input.request.teamMemberName !== undefined
+      ? { teamMemberName: input.request.teamMemberName }
+      : {}),
     taskType: "local_agent",
     traceContext: input.lifecycle.runTraceContext,
     type: "local_agent",

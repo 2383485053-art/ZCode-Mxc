@@ -6,6 +6,7 @@ import type {
   TeamCreateResult,
   TeamDeleteRequest,
   TeamDeleteResult,
+  TeamDeliveryTarget,
   TeamMember,
   TeamMemberRegistration,
   TeamPort,
@@ -19,21 +20,28 @@ import { isPidAlive, TeamStore, TeamStoreError } from "./team-store.js";
 const DEFAULT_MAX_TEAMMATES = 5;
 
 /**
- * TeamManager（M1 实体层 + roster）：团队生命周期、成员名册、进程内路由。
+ * TeamManager（M1 实体层 + roster + 投递）：团队生命周期、成员名册、进程内路由与唤醒。
  * 挂在 lead 的 app 装配里，随主会话存续；跨进程互斥由磁盘上的 leadPid 活性判定兜底。
  *
- * 本 PR 的边界：投递唤醒（steer/复活）随通信层下半场——route 校验白名单并写持久化镜像，
- * 返回 queued；team_delete 尚无关机握手（roster 非空即拒绝）。
+ * 投递（通信层下半场）：成员收件经装配的 TeamDeliveryTarget 送进 lead 进程的子代理任务
+ * 注册表——busy 成员 steer 进活跃 turn，idle 成员带消息后台复活；lead 收件恒 queued
+ * （主会话无任务可 steer，镜像即全部）。team_delete 尚无关机握手（roster 非空即拒绝）。
  */
 export class TeamManager {
   private active: { name: string; generation: number } | undefined;
   private roster: TeamMember[] = [];
+  private deliveryTarget: TeamDeliveryTarget | undefined;
 
   constructor(
     private readonly store: TeamStore,
     private readonly leadSessionId: string,
     private readonly logger?: Logger,
   ) {}
+
+  /** 装配期挂投递钩子（bootstrap 在 AgentRuntime 构造后回填 lead 侧 subagent 端口）。 */
+  attachDeliveryTarget(target: TeamDeliveryTarget | undefined): void {
+    this.deliveryTarget = target;
+  }
 
   get activeTeam(): { name: string; generation: number } | undefined {
     return this.active;
@@ -198,12 +206,11 @@ export class TeamManager {
   }
 
   /**
-   * 路由（实体层部分）：roster 白名单校验 + 持久化镜像 + queued 应答。
-   * 每条消息必有明确结局（送达/入队/拒绝，设计 2.4）——本层负责「入队」与「拒绝」，
-   * 「送达」（steer/复活唤醒）随通信层下半场接在镜像写入之后。
+   * 路由（实体层 + 投递）：roster 白名单校验 → 投递（成员收件 steer/复活，lead 收件入队）
+   * → 持久化镜像。每条消息必有明确结局（送达/入队/拒绝，设计 2.4）。
    * peer 点对点投递自动向 lead 信箱写一行摘要（cc-lead，设计 2.4：lead 对网状对话保持可见）。
    */
-  route(from: string, to: string, request: TeamSendMessage): TeamSendResult {
+  async route(from: string, to: string, request: TeamSendMessage): Promise<TeamSendResult> {
     const messageId = `teammsg_${randomUUID()}`;
     if (!this.active) {
       return sendFailed(messageId, "No active team. Create a team first with team_create.");
@@ -229,10 +236,36 @@ export class TeamManager {
       message: request.message,
       queuedAt: new Date().toISOString(),
     };
-    // 镜像写入是 async 的，但端口契约是同步应答（同 CoordinatorResponsePort 的入队 ack 纪律）。
-    // fire-and-forget + 失败日志：queued 的语义由内存态保证，镜像丢失不回滚应答。
+    // lead 收件：无任务可 steer，入队即结局；成员收件：必须等到 steer/复活的实际结局。
+    if (to === "lead") {
+      void this.mirrorAppend(to, entry);
+      return {
+        status: "success",
+        messageId,
+        message: `Message queued for lead.`,
+        delivery: "queued",
+      };
+    }
+    if (!this.deliveryTarget) {
+      return sendFailed(
+        messageId,
+        `Teammate '${to}' cannot receive messages: delivery is unavailable (subagents disabled?).`,
+      );
+    }
+    const delivered = await this.deliveryTarget.sendMessage(to, {
+      summary: request.summary,
+      message: request.message,
+      trace: request.trace,
+    });
+    if (delivered.status === "failed") {
+      return sendFailed(
+        messageId,
+        `Delivery to teammate '${to}' failed: ${delivered.error ?? delivered.message ?? "unknown error"}`,
+      );
+    }
+    // 镜像写入是 async 的，投递结局达成后 fire-and-forget + 失败日志：镜像丢失不回滚应答。
     void this.mirrorAppend(to, entry);
-    if (from !== "lead" && to !== "lead") {
+    if (from !== "lead") {
       void this.mirrorAppend("lead", {
         ...entry,
         messageId: `${messageId}_cc`,
@@ -240,7 +273,18 @@ export class TeamManager {
         message: `${from} sent to ${to}: ${request.message}`,
       });
     }
-    return { status: "success", messageId, message: `Message queued for ${to}.` };
+    const delivery = delivered.delivery ?? "queued";
+    return {
+      status: "success",
+      messageId,
+      message:
+        delivery === "resumed_background"
+          ? `Teammate '${to}' was idle; resumed in the background with your message.`
+          : delivery === "steered"
+            ? `Message delivered into the active turn of teammate '${to}'.`
+            : `Message queued for ${to}.`,
+      delivery,
+    };
   }
 
   private async mirrorAppend(

@@ -314,8 +314,7 @@ export function createDefaultSubagentPort(
           }),
           // Agent Teams 注入缝：team_spawn_teammate 发起的子代理在此拿到成员端口
           // （from 身份闭包绑定，模型不可谎报）；普通 spawn 不带 teamMemberName，恒缺席。
-          // ⚠️ 唤醒路径（resumeTerminalAgentInBackground）尚未透传 teamMemberName——
-          // 复活的成员暂无 teamPort，随通信层下半场补上。
+          // 唤醒（sendMessage 复活）经任务快照的 teamMemberName 走同一条缝，端口不丢。
           teamPort:
             request.teamMemberName !== undefined && isLeadTeamPort(deps.teamPort)
               ? deps.teamPort.createMemberPort(request.teamMemberName)

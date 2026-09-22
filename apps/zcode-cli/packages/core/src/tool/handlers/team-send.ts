@@ -10,8 +10,12 @@ import {
   type TraceContext,
 } from "@zcode/contracts";
 import type { ToolEntry, ToolHandler } from "../types.js";
+import { assertNotOffPeakTurn } from "./off-peak.js";
 
 const MAX_TEAM_SEND_MODEL_BYTES = 4_096;
+
+const TEAM_SEND_OFF_PEAK_HINT =
+  "Send team messages from a regular turn, not an idle-time task: waking an idle teammate starts a billed run.";
 
 const TEAM_SEND_PROVIDER_OUTPUT_SCHEMA = {
   $schema: "https://json-schema.org/draft/2020-12/schema",
@@ -19,6 +23,7 @@ const TEAM_SEND_PROVIDER_OUTPUT_SCHEMA = {
   properties: {
     success: { type: "boolean" },
     message: { type: "string" },
+    delivery: { type: "string", enum: ["queued", "steered", "resumed_background"] },
   },
   required: ["success", "message"],
   additionalProperties: false,
@@ -39,6 +44,12 @@ const TEAM_SEND_PROVIDER_DESCRIPTION = [
 const teamSendHandler: ToolHandler = async (input, context) => {
   const parsed = TeamSendInputSchema.parse(input) as TeamSendInput;
 
+  // 投递可能唤醒空闲成员（后台复活 = 新的计费 run），与 team_spawn_teammate 同一纪律。
+  assertNotOffPeakTurn(context, TEAM_SEND_TOOL_NAME, {
+    hint: TEAM_SEND_OFF_PEAK_HINT,
+    recoverable: true,
+  });
+
   if (!context.teamPort) {
     throw createCoreError(
       CoreErrorType.ConfigurationError,
@@ -53,7 +64,7 @@ const teamSendHandler: ToolHandler = async (input, context) => {
     );
   }
 
-  return context.teamPort.send(parsed.to, {
+  return await context.teamPort.send(parsed.to, {
     summary: parsed.summary,
     message: parsed.message,
     trace: resolveToolTraceContext(context),
@@ -123,7 +134,13 @@ function formatTeamSendModelContent(output: unknown): string {
   const result = TeamSendOutputSchema.parse(output);
   const continuation = "Continue the current task unless the teammate explicitly changed or ended it.";
   if (result.status === "success") {
-    return `Message ${result.messageId} was queued for the teammate. ${continuation}`;
+    const outcome =
+      result.delivery === "resumed_background"
+        ? "The teammate was idle; it was resumed in the background with your message."
+        : result.delivery === "steered"
+          ? "The message was delivered into the teammate's active turn."
+          : "The message was queued for the teammate.";
+    return `${outcome} ${continuation}`;
   }
   return `Message ${result.messageId} failed to send to the teammate. ${continuation} Failure: ${result.error ?? result.message}.`;
 }
