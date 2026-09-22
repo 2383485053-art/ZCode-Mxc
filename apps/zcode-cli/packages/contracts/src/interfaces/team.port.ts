@@ -317,6 +317,26 @@ export interface TeamDeleteResult {
   error?: string;
 }
 
+/** 接管请求（M3）：按名收编磁盘上原 lead 已死亡的团队。 */
+export interface TeamAdoptRequest {
+  name: string;
+}
+
+/** 接管结果：收编统计进 message；成员全部标记死亡，复活走同名 team_spawn_teammate。 */
+export interface TeamAdoptResult {
+  status: "success" | "failed";
+  teamName?: string;
+  generation?: number;
+  /** 收编时名册里的成员数（全部已标死亡）。 */
+  adoptedMembers?: number;
+  /** 从死亡成员名下释放回 pending 的 in_progress 任务数。 */
+  releasedTasks?: number;
+  /** 全部信箱的在途消息数（lead 的经轮询注入，成员的在复活时补送）。 */
+  pendingMessages?: number;
+  message: string;
+  error?: string;
+}
+
 /**
  * lead（主会话）侧端口：在 team_send 之上加团队生命周期操作。
  * bootstrap 在 features.agentTeams 开启时于主会话装配期注入稳定句柄——工具注册是构造期
@@ -414,6 +434,28 @@ export interface LeadTeamPort extends TeamPort {
   mergeTask(request: TeamMergeRequest): Promise<TeamMergeResult>;
   /** 合流等待（ACL：仅 lead；等非终态任务到达终态，超时带部分结果）。 */
   collectTasks(request: TeamCollectRequest, signal?: AbortSignal): Promise<TeamCollectResult>;
+  /**
+   * 接管（M3，设计 2.3/2.9）：原 lead 进程死亡后，新会话收编磁盘上的团队——世代 +1
+   * 换 lead 身份、成员全部标记死亡（agentId 作废）、释放成员 in_progress 任务、
+   * 看板与信箱原样保留。活 pid 拒绝。
+   */
+  adoptTeam(request: TeamAdoptRequest): Promise<TeamAdoptResult>;
+  /**
+   * 复活补送（M3）：读成员信箱在途消息（复活简报注入用）。读不缩小信箱——消费由
+   * markMemberMessagesDelivered 在 spawn 确认后显式标记。
+   */
+  readMemberPendingMessages(memberName: string): Promise<TeamPendingMessage[]>;
+  /** 标记成员信箱消息已消费（复活 spawn 成功后调用）。 */
+  markMemberMessagesDelivered(memberName: string, messageIds: string[]): Promise<void>;
+}
+
+/** 成员信箱在途消息的复活补送视图。 */
+export interface TeamPendingMessage {
+  messageId: string;
+  from: string;
+  summary: string;
+  message: string;
+  queuedAt: string;
 }
 
 /** 注册门特征检测：成员端口永远不满足（只有 lead 句柄实现生命周期操作）。 */

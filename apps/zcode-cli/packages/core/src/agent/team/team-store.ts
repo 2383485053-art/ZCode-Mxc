@@ -136,6 +136,31 @@ export class TeamStore {
     );
   }
 
+  /**
+   * 看板读取（M3 接管路径）：文件不存在 = 空板；损坏 = 隔离报错（接管宁失败不可
+   * 静默清板——lead 人工处理 board.json 后重试）。
+   */
+  async readBoard(teamName: string): Promise<TeamBoardFile> {
+    const { boardPath } = this.location(teamName);
+    let raw: string;
+    try {
+      raw = await readFile(boardPath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return { schemaVersion: 1, nextId: 1, tasks: [] };
+      }
+      throw new TeamStoreError(`Cannot read ${boardPath}`, "io_error", error);
+    }
+    const parsed = TEAM_BOARD_FILE_SCHEMA.safeParse(JSON.parse(raw));
+    if (!parsed.success) {
+      throw new TeamStoreError(
+        `Team '${teamName}' board.json is invalid: ${parsed.error.message}`,
+        "config_invalid",
+      );
+    }
+    return parsed.data;
+  }
+
   async appendInboxMessage(
     teamName: string,
     member: string,

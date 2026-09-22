@@ -27,6 +27,7 @@ export * from "./respond-to-coordinator.js";
 export * from "./team-send.js";
 export * from "./team-create.js";
 export * from "./team-delete.js";
+export * from "./team-adopt.js";
 export * from "./team-spawn-teammate.js";
 export * from "./task-output.js";
 export * from "./task-stop.js";

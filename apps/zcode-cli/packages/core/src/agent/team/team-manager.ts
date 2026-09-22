@@ -2,10 +2,13 @@
    单 writer 单进程的 M1 边界先在这里稳定（roster/看板/投递共享同一份内存真相与落盘节奏），
    M2/M3 引入跨进程与 hooks 时再按职责拆分。 */
 import { randomUUID } from "node:crypto";
+import { rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type {
   LeadTeamPort,
   Logger,
+  TeamAdoptRequest,
+  TeamAdoptResult,
   TeamCollectRequest,
   TeamCollectResult,
   TeamCreateRequest,
@@ -25,6 +28,7 @@ import type {
   TeamMemberRegistration,
   TeamMemberWorkspaceResult,
   TeamMemberWritePolicy,
+  TeamPendingMessage,
   TeamPort,
   TeamRosterResult,
   TeamSendResult,
@@ -43,7 +47,7 @@ import {
   TEAM_COLLECT_MAX_TIMEOUT_MS,
   TEAM_COLLECT_MIN_TIMEOUT_MS,
 } from "@zcode/contracts";
-import { commitAll, createWorktree, diffFiles, isCheckoutDirty, isGitRepository, isWorktreeDirty, mergeBaseOf, mergeBranch, removeWorktree, runGit } from "./team-git.js";
+import { attachWorktree, commitAll, createWorktree, diffFiles, isCheckoutDirty, isGitRepository, isWorktreeDirty, mergeBaseOf, mergeBranch, removeWorktree, runGit } from "./team-git.js";
 import { matchesAnyScope } from "./team-write-policy.js";
 import { isPidAlive, TeamStore, TeamStoreError } from "./team-store.js";
 
@@ -281,6 +285,116 @@ export class TeamManager {
     }
   }
 
+  /**
+   * 接管（M3，设计 2.3/2.9 验收「杀 lead → 新会话接管继续」）：原 lead 进程死亡后，
+   * 本会话收编磁盘团队——世代 +1 换 lead 身份、成员全标死亡（agentId 随旧进程作废，
+   * worktree 保留）、释放成员 in_progress 任务、看板与信箱原样入内存。活 pid 拒绝；
+   * completed 未合流任务保留 owner（merge gate 按 owner 认分支）。
+   */
+  async adoptTeam(request: TeamAdoptRequest): Promise<TeamAdoptResult> {
+    if (this.active) {
+      return adoptFailed(
+        `Team '${this.active.name}' is already active. Delete it before adopting another.`,
+      );
+    }
+    try {
+      const config = await this.store.readConfig(request.name);
+      if (isPidAlive(config.leadPid)) {
+        return adoptFailed(
+          `Team '${request.name}' is still active in another session (pid ${config.leadPid}). Use it there, or delete it first.`,
+        );
+      }
+      const board = await this.store.readBoard(request.name);
+      const members: TeamMember[] = config.members.map((member) => ({
+        ...member,
+        agentId: undefined,
+        state: "stopped" as const,
+      }));
+      const generation = config.generation + 1;
+      await this.store.writeConfig(request.name, {
+        ...config,
+        members,
+        leadSessionId: this.leadSessionId,
+        leadPid: process.pid,
+        generation,
+      });
+      this.active = { name: request.name, generation };
+      this.roster = members;
+      this.tasks = board.tasks;
+      this.nextTaskId = board.nextId;
+      let releasedTasks = 0;
+      for (const member of members) {
+        releasedTasks += this.releaseOwnedTasks(member.name);
+      }
+      if (releasedTasks > 0) {
+        await this.persistBoard();
+      }
+      // 在途消息盘点：lead 的经轮询注入；成员的在复活简报补送（不在此消费）。
+      let pendingMessages = 0;
+      for (const boxOwner of ["lead", ...members.map((member) => member.name)]) {
+        const inbox = await this.readInboxState(boxOwner);
+        pendingMessages += inbox.messages.filter((message) => message.deliveredAt === undefined)
+          .length;
+      }
+      this.startInboxPolling();
+      this.logger?.info?.("Team adopted", {
+        module: "core.agent.team",
+        team: request.name,
+        generation,
+        adoptedMembers: members.length,
+        releasedTasks,
+      });
+      return {
+        status: "success",
+        teamName: request.name,
+        generation,
+        adoptedMembers: members.length,
+        releasedTasks,
+        pendingMessages,
+        message:
+          `Team '${request.name}' adopted (generation ${generation}). ` +
+          `${members.length} teammate(s) marked dead — revive each with team_spawn_teammate using the same name.` +
+          (releasedTasks > 0
+            ? ` ${releasedTasks} task(s) were released back to the board.`
+            : "") +
+          (pendingMessages > 0
+            ? ` ${pendingMessages} undelivered message(s) preserved: yours will be injected into your next turn; teammates' replay on revival.`
+            : ""),
+      };
+    } catch (error) {
+      return adoptFailed(`Team adoption failed: ${errorMessage(error)}`);
+    }
+  }
+
+  /** 复活补送读取（M3）：成员信箱在途消息（不消费——消费在 spawn 确认后显式标记）。 */
+  async readMemberPendingMessages(memberName: string): Promise<TeamPendingMessage[]> {
+    if (!this.active) return [];
+    const inbox = await this.readInboxState(memberName);
+    return inbox.messages
+      .filter((message) => message.deliveredAt === undefined)
+      .map(({ messageId, from, summary, message, queuedAt }) => ({
+        messageId,
+        from,
+        summary,
+        message,
+        queuedAt,
+      }));
+  }
+
+  async markMemberMessagesDelivered(memberName: string, messageIds: string[]): Promise<void> {
+    if (!this.active || messageIds.length === 0) return;
+    try {
+      await this.store.markInboxDelivered(this.active.name, memberName, messageIds);
+    } catch (error) {
+      this.logger?.warn?.("Team inbox replay-mark failed", {
+        module: "core.agent.team",
+        team: this.active.name,
+        member: memberName,
+        error: errorMessage(error),
+      });
+    }
+  }
+
   async reserveMember(registration: TeamMemberRegistration): Promise<TeamRosterResult> {
     if (!this.active) {
       return rosterFailed("No active team. Create a team first with team_create.");
@@ -288,21 +402,54 @@ export class TeamManager {
     if (registration.name === "lead") {
       return rosterFailed("'lead' is reserved for the lead; pick another teammate name.");
     }
-    if (this.roster.some((member) => member.name === registration.name)) {
-      return rosterFailed(`Teammate '${registration.name}' already exists.`);
+    let revival = false;
+    const existing = this.roster.find((member) => member.name === registration.name);
+    if (existing !== undefined) {
+      // M3 复活：stopped/failed 成员同名重 spawn（复用 worktree 与信箱在途消息）；
+      // 其余状态（spawning/idle/busy）仍是重名拒绝。
+      if (existing.state !== "stopped" && existing.state !== "failed") {
+        return rosterFailed(`Teammate '${registration.name}' already exists.`);
+      }
+      revival = true;
+      const heldWorktree = existing.worktreePath;
+      this.roster = this.roster.filter((member) => member.name !== registration.name);
+      this.roster.push({
+        name: registration.name,
+        profile: registration.profile ?? existing.profile,
+        readOnly: registration.readOnly ?? existing.readOnly,
+        maxTurns: registration.maxTurns ?? existing.maxTurns,
+        state: "spawning",
+        // 复用旧树（setupMemberWorkspace 走 attach 路径）；转成 readOnly 复活则弃树。
+        ...(heldWorktree !== undefined && registration.readOnly !== true
+          ? { worktreePath: heldWorktree }
+          : {}),
+      });
+      if (heldWorktree !== undefined && registration.readOnly === true) {
+        const removed = await removeWorktree(this.workspaceRoot, heldWorktree);
+        if (!removed.ok) {
+          this.logger?.warn?.("Revival worktree reclaim failed; left for manual cleanup", {
+            module: "core.agent.team",
+            team: this.active.name,
+            member: registration.name,
+            worktreePath: heldWorktree,
+            error: removed.error,
+          });
+        }
+      }
+    } else {
+      if (this.roster.length >= this.maxTeammates) {
+        return rosterFailed(
+          `Team is full (${this.maxTeammates} teammates; adjust settings key team.maxTeammates). Finish work before spawning more.`,
+        );
+      }
+      this.roster.push({
+        name: registration.name,
+        ...(registration.profile ? { profile: registration.profile } : {}),
+        ...(registration.readOnly !== undefined ? { readOnly: registration.readOnly } : {}),
+        ...(registration.maxTurns !== undefined ? { maxTurns: registration.maxTurns } : {}),
+        state: "spawning",
+      });
     }
-    if (this.roster.length >= this.maxTeammates) {
-      return rosterFailed(
-        `Team is full (${this.maxTeammates} teammates; adjust settings key team.maxTeammates). Finish work before spawning more.`,
-      );
-    }
-    this.roster.push({
-      name: registration.name,
-      ...(registration.profile ? { profile: registration.profile } : {}),
-      ...(registration.readOnly !== undefined ? { readOnly: registration.readOnly } : {}),
-      ...(registration.maxTurns !== undefined ? { maxTurns: registration.maxTurns } : {}),
-      state: "spawning",
-    });
     const persistError = await this.persistRoster();
     if (persistError) {
       this.roster = this.roster.filter((member) => member.name !== registration.name);
@@ -313,7 +460,9 @@ export class TeamManager {
       teamName: this.active.name,
       memberName: registration.name,
       roster: [...this.roster],
-      message: `Teammate '${registration.name}' reserved.`,
+      message: revival
+        ? `Teammate '${registration.name}' reserved for revival (worktree and queued messages are kept).`
+        : `Teammate '${registration.name}' reserved.`,
     };
   }
 
@@ -423,7 +572,33 @@ export class TeamManager {
       return workspaceFailed(`Teammate '${memberName}' is not on the roster.`);
     }
     if (member.worktreePath !== undefined) {
-      return workspaceFailed(`Teammate '${memberName}' already has a worktree.`);
+      // M3 复活重挂：占位条目带着旧树路径（reserveMember 复用）——目录在则原样复用；
+      // 目录被删则把既有分支挂回去。树损（.git 指针没了）按目录已删处理。
+      if (!(await isGitRepository(this.workspaceRoot))) {
+        return workspaceFailed(
+          `Writer teammates need a git repository at '${this.workspaceRoot}'. ` +
+            "Spawn readOnly teammates in non-git projects, or git init first.",
+        );
+      }
+      const branch = `zcode-team/${this.active.name}/${memberName}`;
+      let worktreeIntact = false;
+      try {
+        worktreeIntact = (await stat(join(member.worktreePath, ".git"))).isFile();
+      } catch {
+        worktreeIntact = false;
+      }
+      if (!worktreeIntact) {
+        await rm(member.worktreePath, { recursive: true, force: true });
+        const attached = await attachWorktree(this.workspaceRoot, member.worktreePath, branch);
+        if (!attached.ok) {
+          return workspaceFailed(attached.error);
+        }
+      }
+      return {
+        status: "success",
+        workspace: { worktreePath: member.worktreePath, branch },
+        message: `Teammate '${memberName}' worktree reused at ${member.worktreePath}.`,
+      };
     }
     if (!(await isGitRepository(this.workspaceRoot))) {
       return workspaceFailed(
@@ -598,8 +773,12 @@ export class TeamManager {
       },
     );
     if (delivered.status === "failed") {
+      const reviveHint =
+        toMember !== undefined && toMember.agentId === undefined
+          ? ` Teammate '${to}' has no live agent; the message stays queued in their inbox and will replay when you revive them (team_spawn_teammate '${to}').`
+          : "";
       return sendFailed(
-        `Delivery to teammate '${to}' failed: ${delivered.error ?? delivered.message ?? "unknown error"}`,
+        `Delivery to teammate '${to}' failed: ${delivered.error ?? delivered.message ?? "unknown error"}.${reviveHint}`,
       );
     }
     void this.markDelivered(to, messageId);
@@ -881,7 +1060,7 @@ export class TeamManager {
     // 名册 → 除名并释放任务，否则下述等待会被「永远 in_progress」的任务拖死。
     const swept = await this.sweepZombieMembers();
     const sweepNote =
-      swept.length > 0 ? ` Released stalled member(s): ${swept.join(", ")}.` : "";
+      swept.length > 0 ? ` Dead member(s): ${swept.join("; ")}.` : "";
     const timeoutMs = Math.min(
       Math.max(request.timeoutMs ?? TEAM_COLLECT_DEFAULT_TIMEOUT_MS, TEAM_COLLECT_MIN_TIMEOUT_MS),
       TEAM_COLLECT_MAX_TIMEOUT_MS,
@@ -1108,8 +1287,8 @@ export class TeamManager {
    */
   private async sweepZombieMembers(): Promise<string[]> {
     if (!this.memberControl || !this.active) return [];
-    const removed: string[] = [];
-    // 同 deleteTeam：removeMember 重赋值 roster，for-of 持旧引用稳定。
+    const notes: string[] = [];
+    // 同 deleteTeam：removeMember 重赋值 roster，for-of 持旧引用稳定；这里只改字段不移除。
     for (const member of this.roster) {
       if (member.agentId === undefined) continue;
       let status: Awaited<ReturnType<TeamMemberControlTarget["getAgentStatus"]>>;
@@ -1118,21 +1297,38 @@ export class TeamManager {
       } catch {
         continue;
       }
-      if (status === "failed" || status === "missing") {
-        const result = await this.removeMember(member.name, `member task ${status} (zombie sweep)`);
-        if (result.status === "success") {
-          removed.push(member.name);
-          this.logger?.warn?.("Zombie teammate swept", {
-            module: "core.agent.team",
-            team: this.active.name,
-            member: member.name,
-            agentId: member.agentId,
-            taskStatus: status,
-          });
-        }
+      if (status !== "failed" && status !== "missing") continue;
+      // M3 死亡标记（取代 M1 的除名）：任务释放 + 人与 worktree 保留。
+      // failed = 进程内任务终态但注册表还在——agentId 留着，sendMessage 仍可复活；
+      // missing = 注册表查无——agentId 作废，只能同名重 spawn 复活（在途消息补送）。
+      const priorState = member.state;
+      const released = this.releaseOwnedTasks(member.name);
+      member.state = status === "missing" ? "stopped" : "failed";
+      if (status === "missing") {
+        member.agentId = undefined;
       }
+      if (released > 0) {
+        await this.persistBoard();
+      }
+      const changed = priorState !== member.state || released > 0;
+      if (!changed) continue;
+      const persistError = await this.persistRoster();
+      if (persistError) {
+        notes.push(`${member.name}: mark ${member.state} failed to persist (${persistError})`);
+        continue;
+      }
+      this.logger?.warn?.("Teammate marked dead", {
+        module: "core.agent.team",
+        team: this.active.name,
+        member: member.name,
+        taskStatus: status,
+        releasedTasks: released,
+      });
+      notes.push(
+        `${member.name} marked ${member.state}${released > 0 ? `, ${released} task(s) released` : ""}; revive with team_spawn_teammate`,
+      );
     }
-    return removed;
+    return notes;
   }
 
   private validateStatusTransition(
@@ -1482,6 +1678,10 @@ export function createLeadTeamPort(manager: TeamManager): LeadTeamPort {
     createTask: (request) => manager.createTask(request),
     mergeTask: (request) => manager.mergeTask(request),
     collectTasks: (request, signal) => manager.collectTasks(request, signal),
+    adoptTeam: (request) => manager.adoptTeam(request),
+    readMemberPendingMessages: (memberName) => manager.readMemberPendingMessages(memberName),
+    markMemberMessagesDelivered: (memberName, messageIds) =>
+      manager.markMemberMessagesDelivered(memberName, messageIds),
   };
 }
 
@@ -1530,6 +1730,10 @@ function mergeRejected(
 
 function sendFailed(reason: string): TeamSendResult {
   return { status: "failed", messageId: `teammsg_${randomUUID()}`, message: "Message was not delivered.", error: reason };
+}
+
+function adoptFailed(reason: string): TeamAdoptResult {
+  return { status: "failed", message: reason, error: reason };
 }
 
 function taskFailed(
