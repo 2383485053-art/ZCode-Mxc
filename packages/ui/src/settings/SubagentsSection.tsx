@@ -68,6 +68,7 @@ import {
   getPluginWorkspaceKey,
   isPluginScopeWorkspaceConnected,
 } from "@/settings/PluginScopeMenu.js";
+import { resolveCommandScopeRecovery } from "@/settings/commandWorkspaceScope.js";
 import { useTabStore } from "@/store/TabStoreProvider.js";
 import { isWorkspaceTab, type WorkspaceTabState } from "@/store/tabStore.js";
 import {
@@ -1376,6 +1377,22 @@ export function SubagentsSection({ onManageModels }: SubagentsSectionProps) {
   );
 
   useEffect(() => {
+    // 目标 Workspace 断开或关闭后 scopeServices 已静默换回本机服务，继续保存会把
+    // 远端路径写进本机磁盘；复用命令页恢复策略：编辑退出表单，新建回退 User。
+    const recovery = resolveCommandScopeRecovery({
+      editing: editingAgent !== null,
+      scopeKey: selectedScopeKey,
+      workspaceTabs,
+    });
+    if (recovery === "keep") return;
+    if (recovery === "close-editor") {
+      setEditingAgent(null);
+      setShowForm(false);
+    }
+    setSelectedScopeKey("user");
+  }, [editingAgent, selectedScopeKey, workspaceTabs]);
+
+  useEffect(() => {
     // remote-waiting 期目标服务尚未注册，此时发 RPC 只会打到断连代理；就绪后再加载。
     if (!targetServicesResolution.rpcReady) return;
     void loadAgents(true);
@@ -1431,6 +1448,10 @@ export function SubagentsSection({ onManageModels }: SubagentsSectionProps) {
       setSaving(true);
       try {
         if (editingAgent) {
+          // 竞态兜底：恢复 effect 收敛状态前目标可能已断开，远端路径不能发给本机服务。
+          if (editingAgent.scope === "workspace" && !selectedWorkspace) {
+            throw new Error("Selected Workspace is no longer available");
+          }
           await subagentsService.updateAgent({
             agentId: editingAgent.id,
             config,
@@ -1463,6 +1484,7 @@ export function SubagentsSection({ onManageModels }: SubagentsSectionProps) {
       editingAgent,
       refresh,
       refreshMentionStore,
+      selectedWorkspace,
       subagentsService,
       targetWorkspaceIdentity,
       targetWorkspacePath,
