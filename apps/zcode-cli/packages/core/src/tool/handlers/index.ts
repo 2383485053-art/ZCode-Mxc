@@ -14,6 +14,8 @@ import {
   RESUME_WORKFLOW_RUN_TOOL_NAME,
   SAVE_WORKFLOW_TOOL_NAME,
   SUBMIT_RESULT_TOOL_NAME,
+  TEAM_CREATE_TOOL_NAME,
+  TEAM_DELETE_TOOL_NAME,
   TEAM_SEND_TOOL_NAME,
   type JsonSchema,
 } from "@zcode/contracts";
@@ -54,6 +56,8 @@ import { askUserQuestionToolEntry } from "./ask-user-question.js";
 import { sendMessageToolEntry } from "./send-message.js";
 import { respondToCoordinatorToolEntry } from "./respond-to-coordinator.js";
 import { teamSendToolEntry } from "./team-send.js";
+import { teamCreateToolEntry } from "./team-create.js";
+import { teamDeleteToolEntry } from "./team-delete.js";
 import { createSubmitResultToolEntry, submitResultToolEntry } from "./submit-result.js";
 import { escalateToolEntry } from "./escalate.js";
 import { resolveWorkflowQuestionToolEntry } from "./resolve-workflow-question.js";
@@ -99,6 +103,9 @@ export const builtInTools: ToolEntry[] = [
   sendMessageToolEntry,
   respondToCoordinatorToolEntry,
   teamSendToolEntry,
+  // lead 生命周期工具：与 team_send 不同门（includeTeamAdmin），只有 lead 句柄才注册。
+  teamCreateToolEntry,
+  teamDeleteToolEntry,
   submitResultToolEntry,
   // actor 的升级通道。与 submit_result 完全同构：
   // 端口在场即注册（includeEscalate），`tools:"none"` 下由 workflow_child 的 allowlist
@@ -167,6 +174,8 @@ interface RegisterBuiltInToolsOptions {
   includeRespondToCoordinator?: boolean;
   /** 团队消息工具；注入了 TeamPort 的会话（lead 或团队成员）才注册。 */
   includeTeamSend?: boolean;
+  /** 团队生命周期工具（team_create/team_delete）；仅注入了 lead 句柄的主会话注册。 */
+  includeTeamAdmin?: boolean;
   includeSubmitResult?: boolean;
   /**
    * 在场时 submit_result 以 typed 声明注册（`{ result: <schema> }`，strict 资格），供 dwf mono
@@ -236,6 +245,14 @@ export function registerBuiltInTools(
     }
     // 团队成员通信：门是 teamPort 在场（Agent Teams M1 spike），非团队成员会话不注册。
     if (entry.metadata.name === TEAM_SEND_TOOL_NAME && options.includeTeamSend !== true) {
+      continue;
+    }
+    // 团队生命周期（lead 独占）：门是 lead 句柄的特征检测，成员端口不满足。
+    if (
+      (entry.metadata.name === TEAM_CREATE_TOOL_NAME ||
+        entry.metadata.name === TEAM_DELETE_TOOL_NAME) &&
+      options.includeTeamAdmin !== true
+    ) {
       continue;
     }
     if (entry.metadata.name === "submit_result" && options.includeSubmitResult !== true) {

@@ -20,7 +20,10 @@ import { createMcpAdapter } from "@zcode/adapters/mcp";
 import {
   AgentRuntime,
   PermissionService,
+  TeamManager,
+  TeamStore,
   buildPluginReferenceCatalog,
+  createLeadTeamPort,
   type AmendWorkflowRunSettingsInput,
   type ResumeSessionResult,
 } from "@zcode/core";
@@ -723,6 +726,13 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       registry: options.providerRegistry,
       currentSelection: () => getRuntime().getSessionModelSelection(),
     });
+    // Agent Teams（M1 实体层）：lead 稳定句柄（四审 P1 方案 a）。工具注册是构造期一次性的，
+    // 而团队是会话中途 team_create 才建的——句柄必须先于注册在场，无团队时各操作快速失败。
+    // 成员端口（spawn PR）由 TeamManager 在派生时铸造，同一实例。
+    const teamManager = new TeamManager(new TeamStore(), sessionId, logger);
+    const teamPort = configResult.config.features.agentTeams
+      ? createLeadTeamPort(teamManager)
+      : undefined;
     runtime = new AgentRuntime(sessionId, runtimeConfig, {
       agentTelemetry: modelTelemetry.agentExecution,
       // 主代理的模型请求过治理器的 observer：立即放行，但让治理器看见它的 429 / 成功。
@@ -774,6 +784,7 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       modelCatalogPort,
       automationPort: options.automationPort,
       offPeakPort: options.offPeakPort,
+      teamPort,
       appVersion,
       traceContext,
     });
