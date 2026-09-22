@@ -14,6 +14,11 @@ import {
   RESUME_WORKFLOW_RUN_TOOL_NAME,
   SAVE_WORKFLOW_TOOL_NAME,
   SUBMIT_RESULT_TOOL_NAME,
+  TASK_CREATE_TOOL_NAME,
+  TASK_LIST_TOOL_NAME,
+  TASK_QUERY_TOOL_NAME,
+  TASK_UPDATE_TOOL_NAME,
+  TEAM_COLLECT_TOOL_NAME,
   TEAM_CREATE_TOOL_NAME,
   TEAM_DELETE_TOOL_NAME,
   TEAM_SEND_TOOL_NAME,
@@ -60,6 +65,11 @@ import { teamSendToolEntry } from "./team-send.js";
 import { teamCreateToolEntry } from "./team-create.js";
 import { teamDeleteToolEntry } from "./team-delete.js";
 import { teamSpawnTeammateToolEntry } from "./team-spawn-teammate.js";
+import { taskCreateToolEntry } from "./task-create.js";
+import { taskListToolEntry } from "./task-list.js";
+import { taskQueryToolEntry } from "./task-query.js";
+import { taskUpdateToolEntry } from "./task-update.js";
+import { teamCollectToolEntry } from "./team-collect.js";
 import { createSubmitResultToolEntry, submitResultToolEntry } from "./submit-result.js";
 import { escalateToolEntry } from "./escalate.js";
 import { resolveWorkflowQuestionToolEntry } from "./resolve-workflow-question.js";
@@ -105,10 +115,16 @@ export const builtInTools: ToolEntry[] = [
   sendMessageToolEntry,
   respondToCoordinatorToolEntry,
   teamSendToolEntry,
-  // lead 生命周期工具：与 team_send 不同门（includeTeamAdmin），只有 lead 句柄才注册。
+  // lead 生命周期与看板管理工具：与 team_send 不同门（includeTeamAdmin），只有 lead 句柄才注册。
   teamCreateToolEntry,
   teamDeleteToolEntry,
   teamSpawnTeammateToolEntry,
+  taskCreateToolEntry,
+  teamCollectToolEntry,
+  // 看板读写：成员窄面端口也能满足（ACL 由 TeamManager 按 caller 身份执行），同 team_send 门。
+  taskListToolEntry,
+  taskQueryToolEntry,
+  taskUpdateToolEntry,
   submitResultToolEntry,
   // actor 的升级通道。与 submit_result 完全同构：
   // 端口在场即注册（includeEscalate），`tools:"none"` 下由 workflow_child 的 allowlist
@@ -175,9 +191,9 @@ interface RegisterBuiltInToolsOptions {
   includeAgent?: boolean;
   includeSendMessage?: boolean;
   includeRespondToCoordinator?: boolean;
-  /** 团队消息工具；注入了 TeamPort 的会话（lead 或团队成员）才注册。 */
-  includeTeamSend?: boolean;
-  /** 团队生命周期工具（team_create/team_delete）；仅注入了 lead 句柄的主会话注册。 */
+  /** 团队协作工具（team_send + 看板读写）；注入了 TeamPort 的会话（lead 或团队成员）才注册。 */
+  includeTeamTools?: boolean;
+  /** 团队生命周期与看板管理（team_create/team_delete/team_spawn_teammate/task_create/team_collect）；仅 lead 句柄注册。 */
   includeTeamAdmin?: boolean;
   includeSubmitResult?: boolean;
   /**
@@ -246,15 +262,24 @@ export function registerBuiltInTools(
     ) {
       continue;
     }
-    // 团队成员通信：门是 teamPort 在场（Agent Teams M1 spike），非团队成员会话不注册。
-    if (entry.metadata.name === TEAM_SEND_TOOL_NAME && options.includeTeamSend !== true) {
+    // 团队协作（team_send + 看板读写）：门是 teamPort 在场，非团队成员会话不注册；
+    // 看板 ACL（成员只能动自己的任务）由 TeamManager 按端口闭包身份执行，不靠注册门。
+    if (
+      (entry.metadata.name === TEAM_SEND_TOOL_NAME ||
+        entry.metadata.name === TASK_LIST_TOOL_NAME ||
+        entry.metadata.name === TASK_QUERY_TOOL_NAME ||
+        entry.metadata.name === TASK_UPDATE_TOOL_NAME) &&
+      options.includeTeamTools !== true
+    ) {
       continue;
     }
-    // 团队生命周期（lead 独占）：门是 lead 句柄的特征检测，成员端口不满足。
+    // 团队生命周期与看板管理（lead 独占）：门是 lead 句柄的特征检测，成员端口不满足。
     if (
       (entry.metadata.name === TEAM_CREATE_TOOL_NAME ||
         entry.metadata.name === TEAM_DELETE_TOOL_NAME ||
-        entry.metadata.name === TEAM_SPAWN_TEAMMATE_TOOL_NAME) &&
+        entry.metadata.name === TEAM_SPAWN_TEAMMATE_TOOL_NAME ||
+        entry.metadata.name === TASK_CREATE_TOOL_NAME ||
+        entry.metadata.name === TEAM_COLLECT_TOOL_NAME) &&
       options.includeTeamAdmin !== true
     ) {
       continue;

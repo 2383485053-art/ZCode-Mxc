@@ -2,8 +2,10 @@ import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promise
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
+  TEAM_BOARD_FILE_SCHEMA,
   TEAM_CONFIG_FILE_SCHEMA,
   TEAM_INBOX_FILE_SCHEMA,
+  type TeamBoardFile,
   type TeamConfigFile,
   type TeamInboxFile,
 } from "@zcode/contracts";
@@ -30,6 +32,7 @@ export class TeamStoreError extends Error {
 export interface TeamStoreLocation {
   teamDir: string;
   configPath: string;
+  boardPath: string;
   inboxPath(member: string): string;
 }
 
@@ -50,6 +53,7 @@ export class TeamStore {
     return {
       teamDir,
       configPath: join(teamDir, "config.json"),
+      boardPath: join(teamDir, "board.json"),
       inboxPath: (member) => join(teamDir, "inboxes", `${member}.json`),
     };
   }
@@ -114,6 +118,19 @@ export class TeamStore {
   async writeConfig(teamName: string, config: TeamConfigFile): Promise<void> {
     const { configPath } = this.location(teamName);
     await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+  }
+
+  /** 看板落盘（内存态是真相，board.json 是镜像；nextId 即水位，M1 单写者）。 */
+  async writeBoard(teamName: string, board: TeamBoardFile): Promise<void> {
+    const { boardPath } = this.location(teamName);
+    const parsed = TEAM_BOARD_FILE_SCHEMA.parse(board);
+    // 落盘形状去派生字段（blocks 读取时派生，双写必漂移）。
+    const tasks = parsed.tasks.map(({ blocks: _blocks, ...task }) => task);
+    await writeFile(
+      boardPath,
+      `${JSON.stringify({ ...parsed, tasks }, null, 2)}\n`,
+      "utf8",
+    );
   }
 
   async appendInboxMessage(

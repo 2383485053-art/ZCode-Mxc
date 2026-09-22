@@ -92,6 +92,7 @@ const teamSpawnTeammateHandler: ToolHandler = async (input, context) => {
   const briefing = [
     `You are teammate "${parsed.name}" on agent team "${reserve.teamName}".`,
     'Your lead is "lead". Task assignments and messages arrive as team messages; answer or report with team_send.',
+    "Work comes from the shared board: task_list shows it; claim an unowned pending task with task_update status=in_progress, finish it with task_update status=completed (the reply names the next claimable task), and pick that up before stopping.",
     "Teammates are resumed per message: finish your current instructions cleanly and stop; you will be woken when there is more to do.",
   ].join("\n");
 

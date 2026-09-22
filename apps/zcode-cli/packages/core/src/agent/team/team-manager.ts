@@ -1,7 +1,12 @@
+/* eslint-disable max-lines -- TeamManager 集中承载团队生命周期/名册/投递路由/看板状态机与 ACL，
+   单 writer 单进程的 M1 边界先在这里稳定（roster/看板/投递共享同一份内存真相与落盘节奏），
+   M2/M3 引入跨进程与 hooks 时再按职责拆分。 */
 import { randomUUID } from "node:crypto";
 import type {
   LeadTeamPort,
   Logger,
+  TeamCollectRequest,
+  TeamCollectResult,
   TeamCreateRequest,
   TeamCreateResult,
   TeamDeleteRequest,
@@ -13,23 +18,54 @@ import type {
   TeamRosterResult,
   TeamSendResult,
   TeamSendMessage,
+  TeamTask,
+  TeamTaskCreateRequest,
+  TeamTaskCreateResult,
+  TeamTaskListResult,
+  TeamTaskQueryRequest,
+  TeamTaskQueryResult,
+  TeamTaskUpdateRequest,
+  TeamTaskUpdateResult,
+} from "@zcode/contracts";
+import {
+  TEAM_COLLECT_DEFAULT_TIMEOUT_MS,
+  TEAM_COLLECT_MAX_TIMEOUT_MS,
+  TEAM_COLLECT_MIN_TIMEOUT_MS,
 } from "@zcode/contracts";
 import { isPidAlive, TeamStore, TeamStoreError } from "./team-store.js";
 
 /** 成员默认上限（设计 2.3 的 3-5 甜点）；settings 键 team.maxTeammates 随治理层 PR 接入。 */
 const DEFAULT_MAX_TEAMMATES = 5;
 
+const COLLECT_POLL_INTERVAL_MS = 500;
+
+/** 终态判定：completed/cancelled 之后看板条目不可再改（设计 2.5）。 */
+function isTaskTerminal(status: TeamTask["status"]): boolean {
+  return status === "completed" || status === "cancelled";
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
- * TeamManager（M1 实体层 + roster + 投递）：团队生命周期、成员名册、进程内路由与唤醒。
- * 挂在 lead 的 app 装配里，随主会话存续；跨进程互斥由磁盘上的 leadPid 活性判定兜底。
+ * TeamManager（M1 实体层 + roster + 投递 + 看板）：团队生命周期、成员名册、进程内路由与唤醒、
+ * 共享任务板。挂在 lead 的 app 装配里，随主会话存续；跨进程互斥由磁盘上的 leadPid 活性判定兜底。
  *
  * 投递（通信层下半场）：成员收件经装配的 TeamDeliveryTarget 送进 lead 进程的子代理任务
  * 注册表——busy 成员 steer 进活跃 turn，idle 成员带消息后台复活；lead 收件恒 queued
  * （主会话无任务可 steer，镜像即全部）。team_delete 尚无关机握手（roster 非空即拒绝）。
+ *
+ * 看板（设计 2.5）：内存是唯一真相（M1 无接管读方），board.json 是 best-effort 镜像；
+ * caller 身份由端口闭包绑定——成员只能认领（unowned pending → in_progress）/完成/归还自己的
+ * 任务，指派与取消仅 lead；一人一 in_progress 任务；blockedBy 全终态才可开跑。
+ * 自动认领的 M1 形态 = 完成回包带下一步可认领提示，由完成者自续跑（spawn 即唤醒源）。
  */
 export class TeamManager {
   private active: { name: string; generation: number } | undefined;
   private roster: TeamMember[] = [];
+  private tasks: TeamTask[] = [];
+  private nextTaskId = 1;
   private deliveryTarget: TeamDeliveryTarget | undefined;
 
   constructor(
@@ -80,6 +116,8 @@ export class TeamManager {
       await this.store.createTeamDir(request.name, config);
       this.active = { name: request.name, generation: config.generation };
       this.roster = [];
+      this.tasks = [];
+      this.nextTaskId = 1;
       this.logger?.info?.("Team created", { module: "core.agent.team", team: request.name });
       return {
         status: "success",
@@ -115,6 +153,8 @@ export class TeamManager {
       await this.store.archiveTeam(name);
       this.active = undefined;
       this.roster = [];
+      this.tasks = [];
+      this.nextTaskId = 1;
       this.logger?.info?.("Team deleted", { module: "core.agent.team", team: name });
       return { status: "success", teamName: name, message: `Team '${name}' archived and deleted.` };
     } catch (error) {
@@ -194,15 +234,34 @@ export class TeamManager {
       this.roster.push(member);
       return rosterFailed(`Teammate removal could not be persisted: ${persistError}`, memberName);
     }
+    // 认领协议的归还半边（设计 2.5）：成员终止 → 名下未终态任务释放回看板重新可认领。
+    const released = this.releaseOwnedTasks(memberName);
+    if (released > 0) {
+      await this.persistBoard();
+    }
+    const releaseNote = released > 0 ? ` ${released} task(s) released back to the board.` : "";
     return {
       status: "success",
       teamName: this.active.name,
       memberName,
       roster: [...this.roster],
       message: reason
-        ? `Teammate '${memberName}' removed: ${reason}`
-        : `Teammate '${memberName}' removed.`,
+        ? `Teammate '${memberName}' removed: ${reason}.${releaseNote}`
+        : `Teammate '${memberName}' removed.${releaseNote}`,
     };
+  }
+
+  private releaseOwnedTasks(memberName: string): number {
+    let released = 0;
+    for (const task of this.tasks) {
+      if (task.owner === memberName && !isTaskTerminal(task.status)) {
+        task.owner = undefined;
+        if (task.status === "in_progress") task.status = "pending";
+        task.updatedAt = new Date().toISOString();
+        released += 1;
+      }
+    }
+    return released;
   }
 
   /**
@@ -287,6 +346,318 @@ export class TeamManager {
     };
   }
 
+  // ============================================================
+  // 共享看板（设计 2.5）
+  // ============================================================
+
+  async createTask(request: TeamTaskCreateRequest): Promise<TeamTaskCreateResult> {
+    if (!this.active) {
+      return taskFailed("No active team. Create a team first with team_create.");
+    }
+    const missing = (request.blockedBy ?? []).filter(
+      (id) => !this.tasks.some((task) => task.id === id),
+    );
+    if (missing.length > 0) {
+      return taskFailed(`Unknown task id(s) in blocked_by: ${missing.join(", ")}.`);
+    }
+    const id = String(this.nextTaskId++);
+    const now = new Date().toISOString();
+    const task: TeamTask = {
+      id,
+      subject: request.subject,
+      ...(request.description !== undefined ? { description: request.description } : {}),
+      ...(request.activeForm !== undefined ? { activeForm: request.activeForm } : {}),
+      status: "pending",
+      blockedBy: [...(request.blockedBy ?? [])],
+      ...(request.sharedContext !== undefined && request.sharedContext.length > 0
+        ? { sharedContext: [...request.sharedContext] }
+        : {}),
+      worklog: `worklogs/${id}.md`,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.tasks.push(task);
+    await this.persistBoard();
+    return {
+      status: "success",
+      taskId: id,
+      task: this.withBlocks(task),
+      message:
+        request.blockedBy !== undefined && request.blockedBy.length > 0
+          ? `Task #${id} created (blocked by ${request.blockedBy.join(", ")}).`
+          : `Task #${id} created.`,
+    };
+  }
+
+  async listTasks(): Promise<TeamTaskListResult> {
+    if (!this.active) {
+      return { status: "failed", tasks: [], message: "No active team.", error: "No active team." };
+    }
+    return {
+      status: "success",
+      teamName: this.active.name,
+      tasks: this.boardView(),
+      message: this.boardSummary(),
+    };
+  }
+
+  async queryTask(request: TeamTaskQueryRequest): Promise<TeamTaskQueryResult> {
+    const task = this.tasks.find((entry) => entry.id === request.taskId);
+    if (!task) {
+      return taskFailed(
+        `Unknown task id '${request.taskId}'. Open tasks: ${this.taskIdHint()}.`,
+      );
+    }
+    return {
+      status: "success",
+      task: this.withBlocks(task),
+      message: `Task #${task.id} '${task.subject}' is ${task.status}${task.owner ? ` (owner ${task.owner})` : ""}.`,
+    };
+  }
+
+  /**
+   * 状态机与 ACL 全走这里（先全量校验后落笔，一步原子）：
+   * 认领 = 无主 pending → in_progress（owner 闭包身份）；归还 = in_progress → pending（清 owner）；
+   * 完成 = 自己的 in_progress → completed；取消 = 仅 lead；blockedBy 全终态才允许 in_progress。
+   */
+  async updateTask(caller: string, request: TeamTaskUpdateRequest): Promise<TeamTaskUpdateResult> {
+    if (!this.active) {
+      return taskFailed("No active team. Create a team first with team_create.");
+    }
+    const task = this.tasks.find((entry) => entry.id === request.taskId);
+    if (!task) {
+      return taskFailed(`Unknown task id '${request.taskId}'. Open tasks: ${this.taskIdHint()}.`);
+    }
+    if (isTaskTerminal(task.status)) {
+      return taskFailed(`Task #${task.id} is already ${task.status}; terminal entries are immutable.`);
+    }
+    const isLead = caller === "lead";
+    const before = { ...task };
+
+    let ownerToSet: string | undefined;
+    if (request.owner !== undefined && request.owner !== task.owner) {
+      if (!isLead) {
+        return taskFailed(
+          "Only the lead can assign or reassign tasks; claim an unowned task with task_update status=in_progress.",
+        );
+      }
+      if (request.owner !== "lead" && !this.roster.some((member) => member.name === request.owner)) {
+        return taskFailed(`'${request.owner}' is not on the roster.`);
+      }
+      ownerToSet = request.owner;
+    }
+
+    let claimOwner: string | undefined;
+    if (request.status !== undefined && request.status !== task.status) {
+      const failure = this.validateStatusTransition(caller, isLead, task, request.status, ownerToSet);
+      if (failure) {
+        return taskFailed(failure);
+      }
+      if (
+        request.status === "in_progress" &&
+        (ownerToSet ?? task.owner) === undefined
+      ) {
+        claimOwner = caller;
+      }
+    }
+
+    if (
+      ownerToSet === undefined &&
+      claimOwner === undefined &&
+      (request.status === undefined || request.status === task.status)
+    ) {
+      return {
+        status: "success",
+        task: this.withBlocks(task),
+        message: `Task #${task.id} unchanged (${task.status}${task.owner ? `, owner ${task.owner}` : ""}).`,
+      };
+    }
+
+    if (ownerToSet !== undefined) task.owner = ownerToSet;
+    if (claimOwner !== undefined) task.owner = claimOwner;
+    if (request.status !== undefined && request.status !== before.status) {
+      task.status = request.status;
+    }
+    // 归还清 owner：任务回板，任何人可再认领。
+    if (request.status === "pending" && before.status === "in_progress") {
+      task.owner = undefined;
+    }
+    task.updatedAt = new Date().toISOString();
+    await this.persistBoard();
+    return {
+      status: "success",
+      task: this.withBlocks(task),
+      message: this.updateMessage(before, task),
+    };
+  }
+
+  /** 合流（设计 2.5）：等调用时刻的非终态任务到达终态；超时带部分结果。 */
+  async collectTasks(
+    request: TeamCollectRequest,
+    signal?: AbortSignal,
+  ): Promise<TeamCollectResult> {
+    if (!this.active) {
+      return { status: "failed", tasks: [], message: "No active team.", error: "No active team." };
+    }
+    const timeoutMs = Math.min(
+      Math.max(request.timeoutMs ?? TEAM_COLLECT_DEFAULT_TIMEOUT_MS, TEAM_COLLECT_MIN_TIMEOUT_MS),
+      TEAM_COLLECT_MAX_TIMEOUT_MS,
+    );
+    const requireAll = request.requireAll ?? true;
+    const targets = this.tasks.filter((task) => !isTaskTerminal(task.status));
+    const targetIds = new Set(targets.map((task) => task.id));
+    const countTerminal = () =>
+      this.tasks.filter((task) => targetIds.has(task.id) && isTaskTerminal(task.status)).length;
+    const reached = () =>
+      requireAll ? countTerminal() === targets.length : countTerminal() >= 1;
+    if (targets.length > 0 && !reached()) {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline && signal?.aborted !== true) {
+        await delay(COLLECT_POLL_INTERVAL_MS);
+        if (reached()) break;
+      }
+    }
+    const terminalCount = countTerminal();
+    const status =
+      targets.length === 0 || terminalCount === targets.length
+        ? ("completed" as const)
+        : terminalCount > 0
+          ? ("partial" as const)
+          : ("timeout" as const);
+    const message =
+      status === "completed"
+        ? targets.length === 0
+          ? "No open tasks on the board."
+          : `All ${targets.length} tracked task(s) reached a terminal state.`
+        : status === "partial"
+          ? `${terminalCount} of ${targets.length} tracked task(s) finished; the rest are still open (deadline reached).`
+          : `None of the ${targets.length} tracked task(s) finished before the deadline.`;
+    return { status, tasks: this.boardView(), message };
+  }
+
+  private validateStatusTransition(
+    caller: string,
+    isLead: boolean,
+    task: TeamTask,
+    target: TeamTask["status"],
+    ownerToSet: string | undefined,
+  ): string | undefined {
+    const effectiveOwner = ownerToSet ?? task.owner;
+    switch (target) {
+      case "in_progress": {
+        if (task.status !== "pending") {
+          return `Task #${task.id} is ${task.status}; only pending tasks can start.`;
+        }
+        const openDeps = task.blockedBy.filter((id) => {
+          const dep = this.tasks.find((entry) => entry.id === id);
+          return dep === undefined || !isTaskTerminal(dep.status);
+        });
+        if (openDeps.length > 0) {
+          return `Task #${task.id} is blocked by unfinished task(s) ${openDeps.join(", ")}.`;
+        }
+        if (effectiveOwner === undefined) {
+          // 一人一任务（设计 2.5 认领协议）：认领者手上不得有未完成的 in_progress。
+          const held = this.tasks.find(
+            (entry) =>
+              entry.id !== task.id && entry.owner === caller && entry.status === "in_progress",
+          );
+          if (!isLead && held) {
+            return `You already hold task #${held.id} in progress; finish or release it first (task_update status=pending).`;
+          }
+        } else if (!isLead && effectiveOwner !== caller) {
+          return `Task #${task.id} is owned by ${effectiveOwner}; only the owner or the lead can start it.`;
+        }
+        return undefined;
+      }
+      case "completed": {
+        if (task.status !== "in_progress") {
+          return `Task #${task.id} is ${task.status}; move it to in_progress before completing.`;
+        }
+        if (!isLead && effectiveOwner !== caller) {
+          return `Task #${task.id} is owned by ${effectiveOwner ?? "nobody"}; only the owner or the lead can complete it.`;
+        }
+        return undefined;
+      }
+      case "pending": {
+        if (task.status !== "in_progress") {
+          return "Only in_progress tasks can be released back to pending.";
+        }
+        if (!isLead && task.owner !== caller) {
+          return `Task #${task.id} is owned by ${task.owner ?? "nobody"}; only the owner or the lead can release it.`;
+        }
+        return undefined;
+      }
+      case "cancelled": {
+        if (!isLead) return "Only the lead can cancel tasks.";
+        return undefined;
+      }
+    }
+  }
+
+  private updateMessage(before: TeamTask, task: TeamTask): string {
+    const parts: string[] = [];
+    if (before.status !== task.status) parts.push(`status ${before.status} → ${task.status}`);
+    if (before.owner !== task.owner) {
+      parts.push(task.owner === undefined ? "owner released" : `owner → ${task.owner}`);
+    }
+    let message = `Task #${task.id} updated (${parts.join(", ")}).`;
+    // 自动认领的 M1 形态：完成回包带下一步可认领提示，由完成者自续跑（无需新唤醒机制）。
+    if (task.status === "completed") {
+      const claimable = this.claimableTasks().slice(0, 3);
+      message +=
+        claimable.length > 0
+          ? ` Next claimable: ${claimable.map((entry) => `#${entry.id} '${entry.subject}'`).join("; ")}.`
+          : " Nothing else is claimable right now.";
+    }
+    return message;
+  }
+
+  /** pending + 无主 + 依赖全终态，按 id 升序（认领协议：最低 ID 优先）。 */
+  private claimableTasks(): TeamTask[] {
+    return this.tasks
+      .filter(
+        (task) =>
+          task.status === "pending" &&
+          task.owner === undefined &&
+          task.blockedBy.every((id) => {
+            const dep = this.tasks.find((entry) => entry.id === id);
+            return dep !== undefined && isTaskTerminal(dep.status);
+          }),
+      )
+      .sort((a, b) => Number(a.id) - Number(b.id));
+  }
+
+  /** blocks 是 blockedBy 的反向投影，读取时派生（双写必漂移）。 */
+  private withBlocks(task: TeamTask): TeamTask {
+    return {
+      ...task,
+      blocks: this.tasks.filter((entry) => entry.blockedBy.includes(task.id)).map((entry) => entry.id),
+    };
+  }
+
+  private boardView(): TeamTask[] {
+    return [...this.tasks]
+      .sort((a, b) => Number(a.id) - Number(b.id))
+      .map((task) => this.withBlocks(task));
+  }
+
+  private boardSummary(): string {
+    const counts = new Map<TeamTask["status"], number>();
+    for (const task of this.tasks) {
+      counts.set(task.status, (counts.get(task.status) ?? 0) + 1);
+    }
+    const detail = [...counts.entries()].map(([status, n]) => `${n} ${status}`).join(", ");
+    return `${this.tasks.length} task(s) on the board${detail ? `: ${detail}` : ""}.`;
+  }
+
+  private taskIdHint(): string {
+    const open = this.tasks
+      .filter((task) => !isTaskTerminal(task.status))
+      .map((task) => `#${task.id}`)
+      .join(", ");
+    return open.length > 0 ? open : "(none)";
+  }
+
   private async mirrorAppend(
     to: string,
     entry: Parameters<TeamStore["appendInboxMessage"]>[2],
@@ -315,6 +686,27 @@ export class TeamManager {
     }
   }
 
+  /**
+   * 看板镜像 best-effort（区别于 roster 的硬失败语义）：board.json 在 M1 没有任何读方
+   * （接管是 M3），内存是唯一真相；落盘失败仅告警，不回滚业务变更。
+   */
+  private async persistBoard(): Promise<void> {
+    if (!this.active) return;
+    try {
+      await this.store.writeBoard(this.active.name, {
+        schemaVersion: 1,
+        nextId: this.nextTaskId,
+        tasks: this.tasks,
+      });
+    } catch (error) {
+      this.logger?.warn?.("Team board mirror write failed", {
+        module: "core.agent.team",
+        team: this.active.name,
+        error: errorMessage(error),
+      });
+    }
+  }
+
   private async readConfigOrSweep(name: string) {
     try {
       return await this.store.readConfig(name);
@@ -329,24 +721,32 @@ export class TeamManager {
 
 /**
  * lead 稳定句柄（四审 P1 方案 a）：装配期注入、先于工具注册在场；
- * 无团队时各操作快速失败。from 身份由闭包绑定，模型不可谎报。
+ * 无团队时各操作快速失败。from/身份由闭包绑定，模型不可谎报。
  */
 export function createLeadTeamPort(manager: TeamManager): LeadTeamPort {
   return {
     send: (to, request) => manager.route("lead", to, request),
+    listTasks: () => manager.listTasks(),
+    queryTask: (request) => manager.queryTask(request),
+    updateTask: (request) => manager.updateTask("lead", request),
     createTeam: (request) => manager.createTeam(request),
     deleteTeam: (request) => manager.deleteTeam(request),
     reserveMember: (registration) => manager.reserveMember(registration),
     completeMemberSpawn: (memberName, agent) => manager.completeMemberSpawn(memberName, agent),
     removeMember: (memberName, reason) => manager.removeMember(memberName, reason),
     createMemberPort: (memberName) => createMemberTeamPort(manager, memberName),
+    createTask: (request) => manager.createTask(request),
+    collectTasks: (request, signal) => manager.collectTasks(request, signal),
   };
 }
 
-/** 成员窄面端口（注入缝用）：identity 同样闭包绑定。 */
+/** 成员窄面端口（注入缝用）：identity 同样闭包绑定；看板只能读 + 动自己的任务。 */
 export function createMemberTeamPort(manager: TeamManager, memberName: string): TeamPort {
   return {
     send: (to, request) => manager.route(memberName, to, request),
+    listTasks: () => manager.listTasks(),
+    queryTask: (request) => manager.queryTask(request),
+    updateTask: (request) => manager.updateTask(memberName, request),
   };
 }
 
@@ -366,6 +766,12 @@ function rosterFailed(reason: string, memberName?: string): TeamRosterResult {
 
 function sendFailed(messageId: string, reason: string): TeamSendResult {
   return { status: "failed", messageId, message: "Message was not delivered.", error: reason };
+}
+
+function taskFailed(
+  reason: string,
+): TeamTaskCreateResult & TeamTaskUpdateResult & TeamTaskQueryResult {
+  return { status: "failed", message: reason, error: reason };
 }
 
 function errorMessage(error: unknown): string {

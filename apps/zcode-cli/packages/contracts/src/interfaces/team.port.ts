@@ -67,6 +67,111 @@ export const TEAM_INBOX_FILE_SCHEMA = z.object({
 });
 export type TeamInboxFile = z.infer<typeof TEAM_INBOX_FILE_SCHEMA>;
 
+// ============================================================
+// 共享看板（设计 2.5）
+// ============================================================
+
+export const TEAM_TASK_STATUS_SCHEMA = z.enum([
+  "pending",
+  "in_progress",
+  "completed",
+  "cancelled",
+]);
+export type TeamTaskStatus = z.infer<typeof TEAM_TASK_STATUS_SCHEMA>;
+
+/**
+ * 看板任务。blocks 不落盘（blockedBy 的反向投影，读取时派生）——双写必漂移。
+ * worklog 相对 ~/.zcode/teams/{name}/（成员 O3 的落笔处，M1 只建引用不建文件）。
+ */
+export const TEAM_TASK_SCHEMA = z.object({
+  id: z.string().min(1),
+  subject: z.string().min(1).max(500),
+  description: z.string().optional(),
+  activeForm: z.string().optional(),
+  status: TEAM_TASK_STATUS_SCHEMA,
+  blockedBy: z.array(z.string().min(1)),
+  owner: z.string().optional(),
+  sharedContext: z.array(z.string()).optional(),
+  worklog: z.string().optional(),
+  blocks: z.array(z.string().min(1)).optional(),
+  createdAt: z.string().min(1),
+  updatedAt: z.string().min(1),
+});
+export type TeamTask = z.infer<typeof TEAM_TASK_SCHEMA>;
+
+/** tasks/board.json 的落盘形状。nextId 即水位（.highwatermark 的进程内等价物，M1 单写者）。 */
+export const TEAM_BOARD_FILE_SCHEMA = z.object({
+  schemaVersion: z.literal(1),
+  nextId: z.number().int().positive(),
+  tasks: z.array(TEAM_TASK_SCHEMA),
+});
+export type TeamBoardFile = z.infer<typeof TEAM_BOARD_FILE_SCHEMA>;
+
+export interface TeamTaskCreateRequest {
+  subject: string;
+  description?: string;
+  activeForm?: string;
+  blockedBy?: string[];
+  sharedContext?: string[];
+}
+
+export interface TeamTaskCreateResult {
+  status: "success" | "failed";
+  taskId?: string;
+  task?: TeamTask;
+  message: string;
+  error?: string;
+}
+
+export interface TeamTaskListResult {
+  status: "success" | "failed";
+  teamName?: string;
+  tasks: TeamTask[];
+  message: string;
+  error?: string;
+}
+
+export interface TeamTaskQueryRequest {
+  taskId: string;
+}
+
+export interface TeamTaskQueryResult {
+  status: "success" | "failed";
+  task?: TeamTask;
+  message: string;
+  error?: string;
+}
+
+/** status/owner 变更；completed/cancelled 为终态不可再改。 */
+export interface TeamTaskUpdateRequest {
+  taskId: string;
+  status?: TeamTaskStatus;
+  owner?: string;
+}
+
+export interface TeamTaskUpdateResult {
+  status: "success" | "failed";
+  task?: TeamTask;
+  message: string;
+  error?: string;
+}
+
+/**
+ * 合流（设计 2.5）：等调用时刻的非终态任务到达终态。requireAll=true（默认）等全部；
+ * false 任一到达即返回。超时返回部分结果——status: completed | partial | timeout。
+ */
+export interface TeamCollectRequest {
+  timeoutMs?: number;
+  requireAll?: boolean;
+}
+
+export interface TeamCollectResult {
+  status: "completed" | "partial" | "timeout" | "failed";
+  tasks: TeamTask[];
+  message: string;
+  error?: string;
+}
+
 export interface TeamSendMessage {
   summary: string;
   message: string;
@@ -106,6 +211,11 @@ export interface TeamPort {
   // 非团队成员会话不受影响。
   // 异步契约：成员收件要等 steer/复活的实际结局才能应答（设计 2.4「明确结局」）。
   send(to: string, request: TeamSendMessage): Promise<TeamSendResult>;
+  // 看板读取/更新（设计 2.5 ACL）：任何团队成员都可读；updateTask 的调用者身份闭包绑定，
+  // 成员只能动自己的任务（认领/完成/归还），lead 不受限。
+  listTasks(): Promise<TeamTaskListResult>;
+  queryTask(request: TeamTaskQueryRequest): Promise<TeamTaskQueryResult>;
+  updateTask(request: TeamTaskUpdateRequest): Promise<TeamTaskUpdateResult>;
 }
 
 export interface TeamCreateRequest {
@@ -167,6 +277,10 @@ export interface LeadTeamPort extends TeamPort {
    * 只有 lead 句柄实现——成员端口永远不满足 isLeadTeamPort。
    */
   createMemberPort(memberName: string): TeamPort;
+  /** 建任务（ACL：仅 lead；成员经 updateTask 认领）。 */
+  createTask(request: TeamTaskCreateRequest): Promise<TeamTaskCreateResult>;
+  /** 合流等待（ACL：仅 lead；等非终态任务到达终态，超时带部分结果）。 */
+  collectTasks(request: TeamCollectRequest, signal?: AbortSignal): Promise<TeamCollectResult>;
 }
 
 /** 注册门特征检测：成员端口永远不满足（只有 lead 句柄实现生命周期操作）。 */
