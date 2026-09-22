@@ -24,6 +24,7 @@ import {
   TeamStore,
   buildPluginReferenceCatalog,
   createLeadTeamPort,
+  createSubagentTeamControl,
   createSubagentTeamDelivery,
   type AmendWorkflowRunSettingsInput,
   type ResumeSessionResult,
@@ -727,10 +728,15 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       registry: options.providerRegistry,
       currentSelection: () => getRuntime().getSessionModelSelection(),
     });
-    // Agent Teams（M1 实体层）：lead 稳定句柄（四审 P1 方案 a）。工具注册是构造期一次性的，
+    // Agent Teams（M1）：lead 稳定句柄（四审 P1 方案 a）+ 治理参数。工具注册是构造期一次性的，
     // 而团队是会话中途 team_create 才建的——句柄必须先于注册在场，无团队时各操作快速失败。
-    // 成员端口（spawn PR）由 TeamManager 在派生时铸造，同一实例。
-    const teamManager = new TeamManager(new TeamStore(), sessionId, logger);
+    // 成员端口由 TeamManager 派生，同一实例。
+    const teamManager = new TeamManager(
+      new TeamStore(),
+      sessionId,
+      logger,
+      configResult.config.team.maxTeammates,
+    );
     const teamPort = configResult.config.features.agentTeams
       ? createLeadTeamPort(teamManager)
       : undefined;
@@ -789,15 +795,19 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       appVersion,
       traceContext,
     });
-    // Agent Teams 投递（通信层下半场）：lead 侧 subagent 端口是成员任务注册表的所有者，
+    // Agent Teams 投递与治理钩子：lead 侧 subagent 端口是成员任务注册表的所有者，
     // AgentRuntime 构造后才存在——这里回填给 TeamManager（成员收件 busy→steer / idle→
-    // 后台复活都经它）。端口缺席（subagents 关闭）时不挂，成员投递届时如实失败。
+    // 后台复活；关机停任务；collect 入口僵尸清扫）。端口缺席（subagents 关闭）时不挂，
+    // 成员投递届时如实失败。
     if (teamPort) {
       const leadSubagentPort = runtime.getSubagentPortForTeamDelivery();
       teamManager.attachDeliveryTarget(
         leadSubagentPort
           ? createSubagentTeamDelivery(leadSubagentPort, { sessionId, workingDirectory })
           : undefined,
+      );
+      teamManager.attachMemberControl(
+        leadSubagentPort ? createSubagentTeamControl(leadSubagentPort) : undefined,
       );
     }
     markRuntimeConstructed({

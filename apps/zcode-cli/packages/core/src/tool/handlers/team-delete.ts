@@ -26,13 +26,13 @@ const TEAM_DELETE_PROVIDER_OUTPUT_SCHEMA = {
 const TEAM_DELETE_PROVIDER_DESCRIPTION = [
   "# team_delete",
   "",
-  "Delete the active team. The team directory is archived under ~/.zcode/teams/.archive/ and the single-team slot is released.",
+  "Shut down and delete the active team: every teammate's background run is stopped, their tasks are released, the team directory is archived under ~/.zcode/teams/.archive/, and the single-team slot is released.",
   "",
   "```json",
   "{}",
   "```",
   "",
-  "Refuses while members are still active; finish or stop their work first.",
+  "Shutdown is forceful (M1): call team_collect first if you want results from in-flight work.",
 ].join("\n");
 
 const teamDeleteHandler: ToolHandler = async (input, context) => {

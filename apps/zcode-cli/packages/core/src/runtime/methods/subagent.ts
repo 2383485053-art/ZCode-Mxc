@@ -1,5 +1,6 @@
 /* eslint-disable max-lines -- subagent runtime wiring 集中衔接 child runtime、tool pool、权限、MCP 与 activity watchdog，拆分需单独迁移。 */
 import { isLeadTeamPort, RESPOND_TO_COORDINATOR_TOOL_NAME } from "@zcode/contracts";
+import { getTeamExecutionGate } from "../../agent/team/team-execution-gate.js";
 import type { SubagentRunOptions } from "@zcode/contracts";
 import {
   defaultScheduler,
@@ -324,7 +325,14 @@ export function createDefaultSubagentPort(
             ? new PermissionService(defaultPermissionConfig)
             : this.permissionService,
           toolScheduler: deps.toolScheduler ?? defaultScheduler,
-          executionPort: deps.executionPort,
+          // Agent Teams O4（设计 2.7）：成员 child 的前台执行过团队级信号量（并发 ≤2，
+          // 按团队共享）；普通 spawn 原样透传。后台 start 不 gate（自带生命周期治理）。
+          executionPort:
+            request.teamMemberName !== undefined &&
+            deps.executionPort !== undefined &&
+            isLeadTeamPort(deps.teamPort)
+              ? getTeamExecutionGate(deps.teamPort, deps.executionPort)
+              : deps.executionPort,
           fileSystemPort: deps.fileSystemPort,
           // Explore 子运行时会暴露 WebFetch，但之前没有继承主 runtime 的
           // HTTP client port，导致工具在真正发请求前抛出配置错误，而不是网络请求失败。

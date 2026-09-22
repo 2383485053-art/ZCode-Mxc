@@ -205,6 +205,16 @@ export interface TeamDeliveryTarget {
   ): Promise<SubagentSendMessageResult>;
 }
 
+/**
+ * 成员控制钩子（治理层）：停成员任务（关机）与探测成员任务状态（僵尸清扫）。
+ * 同投递钩子一样由装配层回填；缺席时关机退化为跳过停止、清扫退化为跳过。
+ */
+export interface TeamMemberControlTarget {
+  stopAgent(agentId: string): Promise<void>;
+  /** running=活跃 run；succeeded/failed=终态；missing=任务不在注册表。 */
+  getAgentStatus(agentId: string): Promise<"running" | "succeeded" | "failed" | "missing">;
+}
+
 export interface TeamPort {
   // 发送方身份由 port closure 绑定（同 CoordinatorResponsePort 纪律），模型不能谎报 from。
   // to 只接受本团队成员名（含 lead），路由层做白名单校验。端口缺席即 team_send 工具不注册，

@@ -58,6 +58,9 @@ export const ConfigKey = {
   SkillsMetadataBudget: "skills.metadataBudget",
   SkillsRoots: "skills.roots",
 
+  // Agent Teams
+  TeamMaxTeammates: "team.maxTeammates",
+
   // Skill / Command 可用性覆盖（按 SKILL.md / 命令 .md 的绝对路径过滤）
   SkillOverrides: "skill",
   CommandOverrides: "command",
@@ -150,7 +153,9 @@ export type ConfigValue<K extends ConfigKey> = K extends "modelStream.idleTimeou
                                                 ? UiLocale
                                                 : K extends "ui.theme"
                                                   ? UiThemePreference
-                                                  : unknown;
+                                                  : K extends "team.maxTeammates"
+                                                    ? number
+                                                    : unknown;
 
 // ============================================================
 // Config Scope
@@ -244,6 +249,10 @@ export interface RuntimeConfig {
     roots: string[];
     [skillPath: string]: boolean | number | string[] | { enable?: boolean };
   };
+  // Agent Teams（M1）：团队上限（治理 2.3 的 3-5 甜点，可收紧）
+  team: {
+    maxTeammates: number;
+  };
   // key 为 SKILL.md 绝对路径，value.enable=false 表示禁用该 skill
   skillOverrides: Record<string, SkillCommandOverride>;
   // key 为命令 .md 绝对路径，value.enable=false 表示禁用该命令
@@ -271,6 +280,7 @@ export interface RuntimeConfigPatch {
   mcp?: Partial<RuntimeConfig["mcp"]>;
   plugins?: Partial<RuntimeConfig["plugins"]>;
   skills?: Partial<RuntimeConfig["skills"]>;
+  team?: Partial<RuntimeConfig["team"]>;
   skillOverrides?: RuntimeConfig["skillOverrides"];
   commandOverrides?: RuntimeConfig["commandOverrides"];
   logging?: Partial<RuntimeConfig["logging"]>;
@@ -337,6 +347,9 @@ export const DefaultRuntimeConfig: RuntimeConfig = {
     includeInstructions: true,
     metadataBudget: 20_000,
     roots: [],
+  },
+  team: {
+    maxTeammates: 5,
   },
   skillOverrides: {},
   commandOverrides: {},

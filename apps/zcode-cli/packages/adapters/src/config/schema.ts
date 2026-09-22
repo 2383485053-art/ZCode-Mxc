@@ -205,6 +205,10 @@ const skillsSchema = z
   })
   .catchall(skillToggleSchema);
 
+const teamSchema = z.object({
+  maxTeammates: z.number().int().min(1).max(16).optional(),
+});
+
 const loggingSchema = z.object({
   level: z.enum(["debug", "info", "warn", "error"]).optional(),
   format: z.enum(["text", "json"]).optional(),
@@ -296,6 +300,7 @@ export const ZCodeConfigFileSchema = z
     mcp: mcpSchema.optional(),
     plugins: pluginsSchema.optional(),
     skills: skillsSchema.optional(),
+    team: teamSchema.optional(),
     skill: skillCommandOverridesSchema.optional(),
     command: skillCommandOverridesSchema.optional(),
     logging: loggingSchema.optional(),
@@ -409,6 +414,7 @@ function parsedConfigFileToRuntimePatch(parsed: ZCodeConfigFile): RuntimeConfigP
   if (parsed.plugins) config.plugins = normalizePluginConfig(parsed.plugins);
   const skillsConfig = parseSkillsRuntimeConfig(parsed.skills);
   if (skillsConfig) config.skills = skillsConfig;
+  if (parsed.team) config.team = parsed.team;
   const skillOverrides = mergeSkillCommandOverrides(
     parsed.skill,
     parseSkillOverridesFromPluralSkills(parsed.skills),

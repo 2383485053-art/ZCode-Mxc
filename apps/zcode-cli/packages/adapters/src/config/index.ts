@@ -170,6 +170,9 @@ class ConfigStore {
       if (config.skills.roots !== undefined)
         this.set(ConfigKey.SkillsRoots, config.skills.roots, scope);
     }
+    if (config.team?.maxTeammates !== undefined) {
+      this.set(ConfigKey.TeamMaxTeammates, config.team.maxTeammates, scope);
+    }
     if (config.skillOverrides !== undefined) {
       this.set(ConfigKey.SkillOverrides, config.skillOverrides, scope);
     }
@@ -317,6 +320,10 @@ export class ConfigPortImpl implements ConfigPort {
           this.store.get(ConfigKey.SkillsMetadataBudget) ?? DefaultConfig.skills.metadataBudget,
         roots: this.store.get(ConfigKey.SkillsRoots) ?? DefaultConfig.skills.roots,
       },
+      team: {
+        maxTeammates:
+          this.store.get(ConfigKey.TeamMaxTeammates) ?? DefaultConfig.team.maxTeammates,
+      },
       skillOverrides: this.store.get(ConfigKey.SkillOverrides) ?? DefaultConfig.skillOverrides,
       commandOverrides:
         this.store.get(ConfigKey.CommandOverrides) ?? DefaultConfig.commandOverrides,
@@ -432,6 +439,8 @@ function getDefaultValue(key: ConfigKey): unknown {
       return defaults.skills.metadataBudget;
     case ConfigKey.SkillsRoots:
       return defaults.skills.roots;
+    case ConfigKey.TeamMaxTeammates:
+      return defaults.team.maxTeammates;
     case ConfigKey.LogLevel:
       return defaults.logging.level;
     case ConfigKey.LogFormat:

@@ -13,6 +13,7 @@ import type {
   TeamDeleteResult,
   TeamDeliveryTarget,
   TeamMember,
+  TeamMemberControlTarget,
   TeamMemberRegistration,
   TeamPort,
   TeamRosterResult,
@@ -49,17 +50,22 @@ function delay(ms: number): Promise<void> {
 }
 
 /**
- * TeamManager（M1 实体层 + roster + 投递 + 看板）：团队生命周期、成员名册、进程内路由与唤醒、
- * 共享任务板。挂在 lead 的 app 装配里，随主会话存续；跨进程互斥由磁盘上的 leadPid 活性判定兜底。
+ * TeamManager（M1 全量：实体 + roster + 投递 + 看板 + 治理）：团队生命周期、成员名册、
+ * 进程内路由与唤醒、共享任务板、关机编排与僵尸清扫。挂在 lead 的 app 装配里，随主会话
+ * 存续；跨进程互斥由磁盘上的 leadPid 活性判定兜底。
  *
  * 投递（通信层下半场）：成员收件经装配的 TeamDeliveryTarget 送进 lead 进程的子代理任务
  * 注册表——busy 成员 steer 进活跃 turn，idle 成员带消息后台复活；lead 收件恒 queued
- * （主会话无任务可 steer，镜像即全部）。team_delete 尚无关机握手（roster 非空即拒绝）。
+ * （主会话无任务可 steer，镜像即全部）。
  *
  * 看板（设计 2.5）：内存是唯一真相（M1 无接管读方），board.json 是 best-effort 镜像；
  * caller 身份由端口闭包绑定——成员只能认领（unowned pending → in_progress）/完成/归还自己的
  * 任务，指派与取消仅 lead；一人一 in_progress 任务；blockedBy 全终态才可开跑。
  * 自动认领的 M1 形态 = 完成回包带下一步可认领提示，由完成者自续跑（spawn 即唤醒源）。
+ *
+ * 治理（设计 2.7，PR6）：deleteTeam = 停成员任务 → 除名（释放任务）→ 归档（token 应答
+ * 握手随 M3 跨进程再上，进程内 lead 拥有成员任务，应答是仪式）；僵尸清扫在 collectTasks
+ * 入口——成员任务 failed/missing 而人还在名册 → 自动除名释放，防「永远 in_progress」。
  */
 export class TeamManager {
   private active: { name: string; generation: number } | undefined;
@@ -67,16 +73,23 @@ export class TeamManager {
   private tasks: TeamTask[] = [];
   private nextTaskId = 1;
   private deliveryTarget: TeamDeliveryTarget | undefined;
+  private memberControl: TeamMemberControlTarget | undefined;
 
   constructor(
     private readonly store: TeamStore,
     private readonly leadSessionId: string,
     private readonly logger?: Logger,
+    private readonly maxTeammates: number = DEFAULT_MAX_TEAMMATES,
   ) {}
 
   /** 装配期挂投递钩子（bootstrap 在 AgentRuntime 构造后回填 lead 侧 subagent 端口）。 */
   attachDeliveryTarget(target: TeamDeliveryTarget | undefined): void {
     this.deliveryTarget = target;
+  }
+
+  /** 装配期挂成员控制钩子（同一端口）：关机停任务 + 僵尸清扫探测。 */
+  attachMemberControl(control: TeamMemberControlTarget | undefined): void {
+    this.memberControl = control;
   }
 
   get activeTeam(): { name: string; generation: number } | undefined {
@@ -129,6 +142,11 @@ export class TeamManager {
     }
   }
 
+  /**
+   * 关机编排（设计 2.5 生命周期的 M1 进程内形态）：世代校验 → 停全部成员任务 →
+   * 逐个除名（释放名下任务）→ 归档。token 应答/可拒收语义随 M3 跨进程再上——
+   * 进程内 lead 拥有成员任务，应答是仪式；成员迟到的 team_send 会被路由白名单挡住。
+   */
   async deleteTeam(_request: TeamDeleteRequest): Promise<TeamDeleteResult> {
     if (!this.active) {
       return failed("No active team to delete.");
@@ -143,12 +161,28 @@ export class TeamManager {
           name,
         );
       }
-      if (config.members.length > 0 || this.roster.length > 0) {
-        // 关机握手随通信层下半场；此前 roster 非空一律拒绝删除。
-        return failed(
-          `Team '${name}' still has ${Math.max(config.members.length, this.roster.length)} member(s); remove them (or wait for the shutdown handshake) before deleting.`,
-          name,
-        );
+      let stopped = 0;
+      // removeMember 以 filter 重赋值 roster，for-of 持旧数组引用，迭代稳定。
+      for (const member of this.roster) {
+        if (member.agentId !== undefined && this.memberControl) {
+          try {
+            await this.memberControl.stopAgent(member.agentId);
+            stopped += 1;
+          } catch (error) {
+            // 停不掉不阻断关机：任务稍后自灭于进程退出，除名后路由白名单也不再认它。
+            this.logger?.warn?.("Team shutdown: stopping member task failed", {
+              module: "core.agent.team",
+              team: name,
+              member: member.name,
+              agentId: member.agentId,
+              error: errorMessage(error),
+            });
+          }
+        }
+        const removed = await this.removeMember(member.name, "team shutdown");
+        if (removed.status === "failed") {
+          return failed(`Team '${name}' shutdown stalled: ${removed.error ?? removed.message}`, name);
+        }
       }
       await this.store.archiveTeam(name);
       this.active = undefined;
@@ -156,7 +190,14 @@ export class TeamManager {
       this.tasks = [];
       this.nextTaskId = 1;
       this.logger?.info?.("Team deleted", { module: "core.agent.team", team: name });
-      return { status: "success", teamName: name, message: `Team '${name}' archived and deleted.` };
+      return {
+        status: "success",
+        teamName: name,
+        message:
+          stopped > 0
+            ? `Team '${name}' shut down (${stopped} member task(s) stopped) and archived.`
+            : `Team '${name}' shut down and archived.`,
+      };
     } catch (error) {
       return failed(`Team deletion failed: ${errorMessage(error)}`, name);
     }
@@ -172,9 +213,9 @@ export class TeamManager {
     if (this.roster.some((member) => member.name === registration.name)) {
       return rosterFailed(`Teammate '${registration.name}' already exists.`);
     }
-    if (this.roster.length >= DEFAULT_MAX_TEAMMATES) {
+    if (this.roster.length >= this.maxTeammates) {
       return rosterFailed(
-        `Team is full (${DEFAULT_MAX_TEAMMATES} teammates). Finish work before spawning more.`,
+        `Team is full (${this.maxTeammates} teammates; adjust settings key team.maxTeammates). Finish work before spawning more.`,
       );
     }
     this.roster.push({
@@ -499,6 +540,11 @@ export class TeamManager {
     if (!this.active) {
       return { status: "failed", tasks: [], message: "No active team.", error: "No active team." };
     }
+    // 僵尸清扫挂在 collect 入口（lead 的自然同步点）：成员任务 failed/missing 而人还在
+    // 名册 → 除名并释放任务，否则下述等待会被「永远 in_progress」的任务拖死。
+    const swept = await this.sweepZombieMembers();
+    const sweepNote =
+      swept.length > 0 ? ` Released stalled member(s): ${swept.join(", ")}.` : "";
     const timeoutMs = Math.min(
       Math.max(request.timeoutMs ?? TEAM_COLLECT_DEFAULT_TIMEOUT_MS, TEAM_COLLECT_MIN_TIMEOUT_MS),
       TEAM_COLLECT_MAX_TIMEOUT_MS,
@@ -527,12 +573,46 @@ export class TeamManager {
     const message =
       status === "completed"
         ? targets.length === 0
-          ? "No open tasks on the board."
-          : `All ${targets.length} tracked task(s) reached a terminal state.`
+          ? `No open tasks on the board.${sweepNote}`
+          : `All ${targets.length} tracked task(s) reached a terminal state.${sweepNote}`
         : status === "partial"
-          ? `${terminalCount} of ${targets.length} tracked task(s) finished; the rest are still open (deadline reached).`
-          : `None of the ${targets.length} tracked task(s) finished before the deadline.`;
+          ? `${terminalCount} of ${targets.length} tracked task(s) finished; the rest are still open (deadline reached).${sweepNote}`
+          : `None of the ${targets.length} tracked task(s) finished before the deadline.${sweepNote}`;
     return { status, tasks: this.boardView(), message };
+  }
+
+  /**
+   * 僵尸清扫（停滞检测 M1 形态 + 失败断路器，设计 2.7）：probing 失败/任务消失的成员
+   * 自动除名（removeMember 顺带释放名下任务）。running/succeeded 不动——succeeded 只是
+   * 上一轮跑完，仍可被唤醒。
+   */
+  private async sweepZombieMembers(): Promise<string[]> {
+    if (!this.memberControl || !this.active) return [];
+    const removed: string[] = [];
+    // 同 deleteTeam：removeMember 重赋值 roster，for-of 持旧引用稳定。
+    for (const member of this.roster) {
+      if (member.agentId === undefined) continue;
+      let status: Awaited<ReturnType<TeamMemberControlTarget["getAgentStatus"]>>;
+      try {
+        status = await this.memberControl.getAgentStatus(member.agentId);
+      } catch {
+        continue;
+      }
+      if (status === "failed" || status === "missing") {
+        const result = await this.removeMember(member.name, `member task ${status} (zombie sweep)`);
+        if (result.status === "success") {
+          removed.push(member.name);
+          this.logger?.warn?.("Zombie teammate swept", {
+            module: "core.agent.team",
+            team: this.active.name,
+            member: member.name,
+            agentId: member.agentId,
+            taskStatus: status,
+          });
+        }
+      }
+    }
+    return removed;
   }
 
   private validateStatusTransition(
