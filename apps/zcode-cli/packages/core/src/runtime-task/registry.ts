@@ -62,6 +62,8 @@ export interface RuntimeTaskSnapshot extends SubagentTaskSnapshot {
    */
   stopInitiator?: "user" | "model";
   taskType?: RuntimeTaskType;
+  /** Agent Teams 成员名；team_spawn_teammate 起的任务才有——唤醒复活时凭它找回成员端口。 */
+  teamMemberName?: string;
   traceContext?: TraceContext;
   turnId?: TurnId;
   usage?: RuntimeTaskUsageSnapshot;

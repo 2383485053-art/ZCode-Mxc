@@ -8,6 +8,7 @@ import {
   CoreErrorType,
   DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS,
   SessionEventType,
+  TEAMMATE_DEFAULT_MAX_TURNS,
   createChildTraceContext,
   createCoreError,
   createSessionEvent,
@@ -84,6 +85,8 @@ export interface ExploreSubagentRuntimeRequest {
   reportActivity?: () => void;
   resumeFromStore?: boolean;
   systemPrompt?: string;
+  /** Agent Teams：非空 = 团队成员 spawn，child deps 据此注入成员 TeamPort。 */
+  teamMemberName?: string;
   workingDirectory: string;
   workspaceRoot: string;
   traceContext: TraceContext;
@@ -979,6 +982,8 @@ async function resumeTerminalAgentInBackground(
     workingDirectory: request.workingDirectory,
     workspaceRoot: request.workspaceRoot,
     trace: request.trace,
+    // Agent Teams：成员任务复活必须带回成员名，否则复活的子会话丢 teamPort（注入缝按它铸端口）。
+    ...(task.teamMemberName !== undefined ? { teamMemberName: task.teamMemberName } : {}),
   };
   const lifecycle = createSubagentLifecycleFromTask(options, resumeRequest, profile, task);
   if (!lifecycle) {
@@ -1143,7 +1148,11 @@ async function runAgentToCompletion(
       disallowedTools: lifecycle.profile.disallowedTools,
       sessionId: lifecycle.childSessionId,
       description: request.description,
-      maxTurns: lifecycle.profile.maxTurns,
+      // 团队成员的 turn 预算默认 20（红旗 1）；显式值 > profile 声明 > 成员默认。
+      maxTurns:
+        request.maxTurns ??
+        lifecycle.profile.maxTurns ??
+        (request.teamMemberName !== undefined ? TEAMMATE_DEFAULT_MAX_TURNS : undefined),
       onSessionReady: notifySessionReady,
       permissionMode: lifecycle.profile.permissionMode,
       prompt: request.prompt,
@@ -1152,6 +1161,7 @@ async function runAgentToCompletion(
       reportActivity: monitorOptions.reportActivity,
       resumeFromStore: executionOptions.resumeFromStore,
       systemPrompt: lifecycle.profile.systemPrompt,
+      teamMemberName: request.teamMemberName,
       workingDirectory: request.workingDirectory,
       workspaceRoot: request.workspaceRoot,
       traceContext: lifecycle.childTraceContext,
@@ -1461,6 +1471,10 @@ function createRuntimeTaskSnapshot(input: {
     prompt: input.request.prompt,
     startedAt: input.startedAt,
     status: input.status,
+    // Agent Teams：快照拍平会丢 request，成员名单独留住，sendMessage 复活时靠它重铸 teamPort。
+    ...(input.request.teamMemberName !== undefined
+      ? { teamMemberName: input.request.teamMemberName }
+      : {}),
     taskType: "local_agent",
     traceContext: input.lifecycle.runTraceContext,
     type: "local_agent",

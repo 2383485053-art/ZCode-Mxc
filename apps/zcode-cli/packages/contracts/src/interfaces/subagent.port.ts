@@ -19,6 +19,10 @@ export interface SubagentRunRequest {
   workingDirectory: string;
   workspaceRoot: string;
   trace: TraceContext;
+  /** Agent Teams：由 team_spawn_teammate 设置；child deps 据此注入成员 TeamPort。非团队 spawn 恒缺席。 */
+  teamMemberName?: string;
+  /** Agent Teams：显式 maxTurns（优先于 profile 声明）。 */
+  maxTurns?: number;
 }
 
 export interface SubagentRunOptions {

@@ -307,6 +307,14 @@ export class AgentRuntime {
     runtime.startMcpStartup(this.rootTraceContext);
   }
 
+  /**
+   * Agent Teams 投递钩子装配用：lead 侧 subagent 端口（团队成员任务注册表的所有者）。
+   * bootstrap 在构造后把它包成 TeamDeliveryTarget 挂到 TeamManager 上。
+   */
+  getSubagentPortForTeamDelivery(): SubagentPort | undefined {
+    return this.subagentPort;
+  }
+
   async closeBrowserSession(): Promise<void> {
     this.beginShutdown();
     disposeNodeReplSession(this.sessionId);

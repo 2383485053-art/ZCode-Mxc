@@ -20,7 +20,12 @@ import { createMcpAdapter } from "@zcode/adapters/mcp";
 import {
   AgentRuntime,
   PermissionService,
+  TeamManager,
+  TeamStore,
   buildPluginReferenceCatalog,
+  createLeadTeamPort,
+  createSubagentTeamControl,
+  createSubagentTeamDelivery,
   type AmendWorkflowRunSettingsInput,
   type ResumeSessionResult,
 } from "@zcode/core";
@@ -723,6 +728,18 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       registry: options.providerRegistry,
       currentSelection: () => getRuntime().getSessionModelSelection(),
     });
+    // Agent Teams（M1）：lead 稳定句柄（四审 P1 方案 a）+ 治理参数。工具注册是构造期一次性的，
+    // 而团队是会话中途 team_create 才建的——句柄必须先于注册在场，无团队时各操作快速失败。
+    // 成员端口由 TeamManager 派生，同一实例。
+    const teamManager = new TeamManager(
+      new TeamStore(),
+      sessionId,
+      logger,
+      configResult.config.team.maxTeammates,
+    );
+    const teamPort = configResult.config.features.agentTeams
+      ? createLeadTeamPort(teamManager)
+      : undefined;
     runtime = new AgentRuntime(sessionId, runtimeConfig, {
       agentTelemetry: modelTelemetry.agentExecution,
       // 主代理的模型请求过治理器的 observer：立即放行，但让治理器看见它的 429 / 成功。
@@ -774,9 +791,25 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       modelCatalogPort,
       automationPort: options.automationPort,
       offPeakPort: options.offPeakPort,
+      teamPort,
       appVersion,
       traceContext,
     });
+    // Agent Teams 投递与治理钩子：lead 侧 subagent 端口是成员任务注册表的所有者，
+    // AgentRuntime 构造后才存在——这里回填给 TeamManager（成员收件 busy→steer / idle→
+    // 后台复活；关机停任务；collect 入口僵尸清扫）。端口缺席（subagents 关闭）时不挂，
+    // 成员投递届时如实失败。
+    if (teamPort) {
+      const leadSubagentPort = runtime.getSubagentPortForTeamDelivery();
+      teamManager.attachDeliveryTarget(
+        leadSubagentPort
+          ? createSubagentTeamDelivery(leadSubagentPort, { sessionId, workingDirectory })
+          : undefined,
+      );
+      teamManager.attachMemberControl(
+        leadSubagentPort ? createSubagentTeamControl(leadSubagentPort) : undefined,
+      );
+    }
     markRuntimeConstructed({
       hasInjectedModelAdapter: options.modelAdapter !== undefined,
       sessionId,

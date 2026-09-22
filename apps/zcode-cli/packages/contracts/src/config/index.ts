@@ -36,6 +36,7 @@ export const ConfigKey = {
   FeatureMemory: "features.memory",
   FeatureSkill: "features.skill",
   FeatureMcp: "features.mcp",
+  FeatureAgentTeams: "features.agentTeams",
 
   // Memory
   MemoryUse: "memory.use",
@@ -56,6 +57,9 @@ export const ConfigKey = {
   SkillsIncludeInstructions: "skills.includeInstructions",
   SkillsMetadataBudget: "skills.metadataBudget",
   SkillsRoots: "skills.roots",
+
+  // Agent Teams
+  TeamMaxTeammates: "team.maxTeammates",
 
   // Skill / Command 可用性覆盖（按 SKILL.md / 命令 .md 的绝对路径过滤）
   SkillOverrides: "skill",
@@ -109,6 +113,7 @@ export type ConfigValue<K extends ConfigKey> = K extends "modelStream.idleTimeou
                   | "features.memory"
                   | "features.skill"
                   | "features.mcp"
+                  | "features.agentTeams"
                   | "skills.enabled"
                   | "skills.includeInstructions"
               ? boolean
@@ -148,7 +153,9 @@ export type ConfigValue<K extends ConfigKey> = K extends "modelStream.idleTimeou
                                                 ? UiLocale
                                                 : K extends "ui.theme"
                                                   ? UiThemePreference
-                                                  : unknown;
+                                                  : K extends "team.maxTeammates"
+                                                    ? number
+                                                    : unknown;
 
 // ============================================================
 // Config Scope
@@ -225,6 +232,8 @@ export interface RuntimeConfig {
     memory: boolean;
     skill: boolean;
     mcp: boolean;
+    // Agent Teams(M1):默认关;开=lead 会话注入 teamPort 并注册 team_* 工具面
+    agentTeams: boolean;
   };
   memory: {
     use: boolean;
@@ -239,6 +248,10 @@ export interface RuntimeConfig {
     metadataBudget: number;
     roots: string[];
     [skillPath: string]: boolean | number | string[] | { enable?: boolean };
+  };
+  // Agent Teams（M1）：团队上限（治理 2.3 的 3-5 甜点，可收紧）
+  team: {
+    maxTeammates: number;
   };
   // key 为 SKILL.md 绝对路径，value.enable=false 表示禁用该 skill
   skillOverrides: Record<string, SkillCommandOverride>;
@@ -267,6 +280,7 @@ export interface RuntimeConfigPatch {
   mcp?: Partial<RuntimeConfig["mcp"]>;
   plugins?: Partial<RuntimeConfig["plugins"]>;
   skills?: Partial<RuntimeConfig["skills"]>;
+  team?: Partial<RuntimeConfig["team"]>;
   skillOverrides?: RuntimeConfig["skillOverrides"];
   commandOverrides?: RuntimeConfig["commandOverrides"];
   logging?: Partial<RuntimeConfig["logging"]>;
@@ -312,6 +326,7 @@ export const DefaultRuntimeConfig: RuntimeConfig = {
     memory: true,
     skill: true,
     mcp: true,
+    agentTeams: false,
   },
   memory: {
     use: true,
@@ -332,6 +347,9 @@ export const DefaultRuntimeConfig: RuntimeConfig = {
     includeInstructions: true,
     metadataBudget: 20_000,
     roots: [],
+  },
+  team: {
+    maxTeammates: 5,
   },
   skillOverrides: {},
   commandOverrides: {},

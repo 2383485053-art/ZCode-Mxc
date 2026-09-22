@@ -126,6 +126,8 @@ class ConfigStore {
         this.set(ConfigKey.FeatureSkill, config.features.skill, scope);
       if (config.features.mcp !== undefined)
         this.set(ConfigKey.FeatureMcp, config.features.mcp, scope);
+      if (config.features.agentTeams !== undefined)
+        this.set(ConfigKey.FeatureAgentTeams, config.features.agentTeams, scope);
     }
     if (config.memory) {
       if (config.memory.use !== undefined) this.set(ConfigKey.MemoryUse, config.memory.use, scope);
@@ -167,6 +169,9 @@ class ConfigStore {
       }
       if (config.skills.roots !== undefined)
         this.set(ConfigKey.SkillsRoots, config.skills.roots, scope);
+    }
+    if (config.team?.maxTeammates !== undefined) {
+      this.set(ConfigKey.TeamMaxTeammates, config.team.maxTeammates, scope);
     }
     if (config.skillOverrides !== undefined) {
       this.set(ConfigKey.SkillOverrides, config.skillOverrides, scope);
@@ -287,6 +292,7 @@ export class ConfigPortImpl implements ConfigPort {
         memory: this.store.get(ConfigKey.FeatureMemory) ?? true,
         skill: this.store.get(ConfigKey.FeatureSkill) ?? true,
         mcp: this.store.get(ConfigKey.FeatureMcp) ?? true,
+        agentTeams: this.store.get(ConfigKey.FeatureAgentTeams) ?? false,
       },
       memory: {
         use: this.store.get(ConfigKey.MemoryUse) ?? DefaultConfig.memory.use,
@@ -313,6 +319,10 @@ export class ConfigPortImpl implements ConfigPort {
         metadataBudget:
           this.store.get(ConfigKey.SkillsMetadataBudget) ?? DefaultConfig.skills.metadataBudget,
         roots: this.store.get(ConfigKey.SkillsRoots) ?? DefaultConfig.skills.roots,
+      },
+      team: {
+        maxTeammates:
+          this.store.get(ConfigKey.TeamMaxTeammates) ?? DefaultConfig.team.maxTeammates,
       },
       skillOverrides: this.store.get(ConfigKey.SkillOverrides) ?? DefaultConfig.skillOverrides,
       commandOverrides:
@@ -429,6 +439,8 @@ function getDefaultValue(key: ConfigKey): unknown {
       return defaults.skills.metadataBudget;
     case ConfigKey.SkillsRoots:
       return defaults.skills.roots;
+    case ConfigKey.TeamMaxTeammates:
+      return defaults.team.maxTeammates;
     case ConfigKey.LogLevel:
       return defaults.logging.level;
     case ConfigKey.LogFormat:

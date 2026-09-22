@@ -7,6 +7,7 @@ import {
   registerBuiltInTools,
   traceContextToLogContext,
 } from "../deps.js";
+import { isLeadTeamPort } from "@zcode/contracts";
 import type { HookRunner, SessionId, ToolExecutor, TraceContext } from "../deps.js";
 import type { AgentRuntimeInternal } from "../internal.js";
 import type { AgentRuntimeDeps } from "../types.js";
@@ -53,8 +54,10 @@ function registerRuntimeBuiltInTools(runtime: AgentRuntimeInternal, deps: AgentR
     includeSendMessage: runtime.subagentPort?.sendMessage !== undefined,
     includeRespondToCoordinator:
       runtime.config.taskType === "subagent_child" && Boolean(deps.coordinatorResponsePort),
-    // Agent Teams M1 spike：teamPort 在场即注册 team_send；spike 阶段无注入方，恒缺席。
-    includeTeamSend: Boolean(deps.teamPort),
+    // Agent Teams M1：teamPort 在场即注册 team_send + 看板读写；lead 句柄（含 createTeam）
+    // 另开生命周期/看板管理门——成员端口不满足 isLeadTeamPort，天然只有 lead 注册。
+    includeTeamTools: Boolean(deps.teamPort),
+    includeTeamAdmin: isLeadTeamPort(deps.teamPort),
     // submit_result 只在注入了 workflowSubmitPort 的 workflow actor 会话注册。以端口存在为门，
     // 与 taskType 无关：workflow actor 是 workflow_child，其 runtimeScope 目前是 "main"。
     includeSubmitResult: Boolean(deps.workflowSubmitPort),

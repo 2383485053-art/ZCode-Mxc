@@ -16,3 +16,5 @@ export type {
   CacheStats,
 } from "./message-history.js";
 export type { SessionHistoryHydrationResult } from "./session-history-hydrator.js";
+// Agent Teams（M1 实体层）：TeamManager 与 lead/member 端口工厂。
+export * from "./team/index.js";
