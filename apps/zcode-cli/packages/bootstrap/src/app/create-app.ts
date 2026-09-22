@@ -811,6 +811,9 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
       teamManager.attachMemberControl(
         leadSubagentPort ? createSubagentTeamControl(leadSubagentPort) : undefined,
       );
+      // 团队 hooks（M2）：TeammateIdle/TaskCompleted 通知转发给 lead runtime 的
+      // hookRunner（Base 字段 runtime 补齐；hooks 未启用时静默跳过）。
+      teamManager.attachTeamHook({ runTeamHook: (input) => runtime.runTeamHook(input) });
     }
     markRuntimeConstructed({
       hasInjectedModelAdapter: options.modelAdapter !== undefined,

@@ -282,6 +282,8 @@ const hooksSchema = z
         PostToolUse: z.array(hookMatcherSchema).optional(),
         PostToolUseFailure: z.array(hookMatcherSchema).optional(),
         Stop: z.array(hookMatcherSchema).optional(),
+        TeammateIdle: z.array(hookMatcherSchema).optional(),
+        TaskCompleted: z.array(hookMatcherSchema).optional(),
       })
       .strict()
       .optional(),

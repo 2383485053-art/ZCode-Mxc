@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { SubagentSendMessageResult } from "./subagent.port.js";
+import type { TaskCompletedHookInput, TeammateIdleHookInput } from "../hooks/index.js";
 import type { TeamMergeRejection } from "../tools/team-merge.js";
 import type { TraceContext } from "../tracing/tracer.js";
 
@@ -219,6 +220,8 @@ export interface TeamSendResult {
   message: string;
   error?: string;
   delivery?: TeamDeliveryState;
+  /** M2 广播（`*`）：逐个投递中失败的收件人（含原因摘要）；全部失败才 status=failed。 */
+  failedRecipients?: string[];
 }
 
 /**
@@ -324,14 +327,34 @@ export interface TeamMemberWorkspaceResult {
 }
 
 /**
- * 写策略快照（注入缝 veto 用）：worktreePath 缺席 = 该成员不设防（readOnly/普通
- * spawn）；scope 是该成员当前 in_progress 任务的写范围，缺席 = 树内不限（merge
- * gate 的 out-of-scope 断言兜底）。同步查询——scope 随认领动态变化，gate 在
- * 每次文件写工具调用时取最新值。
+ * 写策略快照（注入缝 veto 用）：worktreePath 缺席 = 该成员不设防（普通
+ * spawn/成员已不在名册）；scope 是该成员当前 in_progress 任务的写范围，缺席 =
+ * 树内不限（merge gate 的 out-of-scope 断言兜底）；readOnly = reviewer 型成员，
+ * 一切文件写被拒（M2 硬化，设计 2.6「reviewer 无 worktree，主 checkout 只读」）。
+ * 同步查询——scope 随认领动态变化，gate 在每次文件写工具调用时取最新值。
  */
 export interface TeamMemberWritePolicy {
   worktreePath?: string;
   scope?: string[];
+  readOnly?: boolean;
+}
+
+/**
+ * 团队 hooks 触发钩子（M2，设计 2.7）：TeamManager 在 TaskCompleted/TeammateIdle
+ * 时机 fire-and-forget 通知；装配层（bootstrap）接到 lead runtime 的 hookRunner，
+ * Base 字段（cwd/mode/sessionId/trace）由 runtime 补齐——hookEventName 与业务
+ * 字段由触发侧携带。
+ * 通知型——hook 失败只告警，不回滚业务变更。
+ */
+export type TeamHookBaseContext =
+  "cwd" | "mode" | "sessionId" | "timestamp" | "traceId" | "turnId" | "agentName";
+
+export type TeamHookNotification =
+  | Omit<TeammateIdleHookInput, TeamHookBaseContext>
+  | Omit<TaskCompletedHookInput, TeamHookBaseContext>;
+
+export interface TeamHookTarget {
+  runTeamHook(input: TeamHookNotification): Promise<void>;
 }
 
 export interface LeadTeamPort extends TeamPort {

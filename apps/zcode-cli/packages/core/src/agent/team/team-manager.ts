@@ -13,6 +13,8 @@ import type {
   TeamDeleteRequest,
   TeamDeleteResult,
   TeamDeliveryTarget,
+  TeamHookTarget,
+  TeamHookNotification,
   TeamMergeRejection,
   TeamMergeRequest,
   TeamMergeResult,
@@ -99,6 +101,7 @@ export class TeamManager {
   private nextTaskId = 1;
   private deliveryTarget: TeamDeliveryTarget | undefined;
   private memberControl: TeamMemberControlTarget | undefined;
+  private teamHook: TeamHookTarget | undefined;
 
   constructor(
     private readonly store: TeamStore,
@@ -117,6 +120,23 @@ export class TeamManager {
   /** 装配期挂成员控制钩子（同一端口）：关机停任务 + 僵尸清扫探测。 */
   attachMemberControl(control: TeamMemberControlTarget | undefined): void {
     this.memberControl = control;
+  }
+
+  /** 装配期挂团队 hooks 触发钩子（TaskCompleted/TeammateIdle，通知型）。 */
+  attachTeamHook(target: TeamHookTarget | undefined): void {
+    this.teamHook = target;
+  }
+
+  /** 通知型 hook：失败只告警，绝不影响业务应答（fire-and-forget）。 */
+  private notifyTeamHook(input: TeamHookNotification): void {
+    if (this.teamHook === undefined) return;
+    void this.teamHook.runTeamHook(input).catch((error) => {
+      this.logger?.warn?.("Team hook notification failed", {
+        module: "core.agent.team",
+        hookEventName: input.hookEventName,
+        error: errorMessage(error),
+      });
+    });
   }
 
   get activeTeam(): { name: string; generation: number } | undefined {
@@ -284,6 +304,12 @@ export class TeamManager {
     if (persistError) {
       return rosterFailed(`Teammate spawn could not be persisted: ${persistError}`, memberName);
     }
+    // 成员就绪即可派活——TeammateIdle 通知型 hook（设计 2.7）。
+    this.notifyTeamHook({
+      hookEventName: "TeammateIdle",
+      memberName,
+      teamName: this.active.name,
+    });
     return {
       status: "success",
       teamName: this.active.name,
@@ -414,7 +440,10 @@ export class TeamManager {
   /** 写策略快照（注入缝 veto 用）：树边界 spawn 期定死，scope 随认领动态取。 */
   getMemberWritePolicy(memberName: string): TeamMemberWritePolicy {
     const member = this.roster.find((entry) => entry.name === memberName);
-    if (member === undefined || member.worktreePath === undefined) return {};
+    if (member === undefined) return {};
+    // reviewer 型成员（readOnly）：无树且一切文件写被拒（M2 硬化，设计 2.6）。
+    if (member.readOnly === true) return { readOnly: true };
+    if (member.worktreePath === undefined) return {};
     const held = this.tasks.find(
       (task) => task.owner === memberName && task.status === "in_progress",
     );
@@ -456,26 +485,30 @@ export class TeamManager {
   /**
    * 路由（实体层 + 投递）：roster 白名单校验 → 投递（成员收件 steer/复活，lead 收件入队）
    * → 持久化镜像。每条消息必有明确结局（送达/入队/拒绝，设计 2.4）。
+   * `*` 广播含 lead、逐个投递，部分失败收集进 failedRecipients（全部失败才整体
+   * failed——设计 2.4 广播降级 M2 的落地形态）。
    * peer 点对点投递自动向 lead 信箱写一行摘要（cc-lead，设计 2.4：lead 对网状对话保持可见）。
    */
   async route(from: string, to: string, request: TeamSendMessage): Promise<TeamSendResult> {
-    const messageId = `teammsg_${randomUUID()}`;
     if (!this.active) {
-      return sendFailed(messageId, "No active team. Create a team first with team_create.");
+      return sendFailed("No active team. Create a team first with team_create.");
     }
     if (to === from) {
-      return sendFailed(messageId, "Cannot send a team message to yourself.");
+      return sendFailed("Cannot send a team message to yourself.");
+    }
+    if (to === "*") {
+      return this.broadcast(from, request);
     }
     const toMember = to === "lead" ? undefined : this.roster.find((member) => member.name === to);
     if (to !== "lead" && !toMember) {
       return sendFailed(
-        messageId,
         `Unknown teammate '${to}'. Current roster: lead${this.roster.map((m) => `, ${m.name}`).join("")}.`,
       );
     }
     if (toMember?.state === "spawning") {
-      return sendFailed(messageId, `Teammate '${to}' is still spawning; retry shortly.`);
+      return sendFailed(`Teammate '${to}' is still spawning; retry shortly.`);
     }
+    const messageId = `teammsg_${randomUUID()}`;
     const entry = {
       messageId,
       from,
@@ -496,7 +529,6 @@ export class TeamManager {
     }
     if (!this.deliveryTarget) {
       return sendFailed(
-        messageId,
         `Teammate '${to}' cannot receive messages: delivery is unavailable (subagents disabled?).`,
       );
     }
@@ -514,7 +546,6 @@ export class TeamManager {
     );
     if (delivered.status === "failed") {
       return sendFailed(
-        messageId,
         `Delivery to teammate '${to}' failed: ${delivered.error ?? delivered.message ?? "unknown error"}`,
       );
     }
@@ -539,6 +570,48 @@ export class TeamManager {
             ? `Message delivered into the active turn of teammate '${to}'.`
             : `Message queued for ${to}.`,
       delivery,
+    };
+  }
+
+  /** 广播（`*`）：lead + 全部就绪成员逐个投递；单点失败不中止其余（设计 2.4）。 */
+  private async broadcast(from: string, request: TeamSendMessage): Promise<TeamSendResult> {
+    const messageId = `teammsg_${randomUUID()}`;
+    const recipients = [
+      ...(from === "lead" ? [] : ["lead"]),
+      ...this.roster.filter((member) => member.state !== "spawning").map((member) => member.name),
+    ];
+    if (recipients.length === 0) {
+      return sendFailed("Broadcast has no recipients.");
+    }
+    const failedRecipients: string[] = [];
+    let delivered = 0;
+    for (const recipient of recipients) {
+      const result = await this.route(from, recipient, request);
+      if (result.status === "failed") {
+        failedRecipients.push(`${recipient} (${result.error ?? result.message})`);
+      } else {
+        delivered += 1;
+      }
+    }
+    if (delivered === 0) {
+      return {
+        status: "failed",
+        messageId,
+        message: `Broadcast failed for all ${failedRecipients.length} recipient(s).`,
+        error: failedRecipients.join("; "),
+        failedRecipients: failedRecipients.map(entry => entry.split(" (")[0]),
+      };
+    }
+    return {
+      status: "success",
+      messageId,
+      message:
+        failedRecipients.length > 0
+          ? `Broadcast delivered to ${delivered} recipient(s); failed for ${failedRecipients.length}: ${failedRecipients.join("; ")}.`
+          : `Broadcast delivered to ${delivered} recipient(s).`,
+      ...(failedRecipients.length > 0
+        ? { failedRecipients: failedRecipients.map(entry => entry.split(" (")[0]) }
+        : {}),
     };
   }
 
@@ -721,6 +794,23 @@ export class TeamManager {
       await this.writeWorklog(task);
     }
     await this.persistBoard();
+    if (task.status === "completed" && this.active) {
+      this.notifyTeamHook({
+        hookEventName: "TaskCompleted",
+        owner: task.owner,
+        subject: task.subject,
+        taskId: task.id,
+        teamName: this.active.name,
+      });
+      // 完成回包提示过下一步可认领；无活可干即空闲——TeammateIdle 通知（设计 2.7）。
+      if (this.claimableTasks().length === 0 && task.owner !== undefined) {
+        this.notifyTeamHook({
+          hookEventName: "TeammateIdle",
+          memberName: task.owner,
+          teamName: this.active.name,
+        });
+      }
+    }
     return {
       status: "success",
       task: this.withBlocks(task),
@@ -1245,8 +1335,8 @@ function mergeRejected(
   };
 }
 
-function sendFailed(messageId: string, reason: string): TeamSendResult {
-  return { status: "failed", messageId, message: "Message was not delivered.", error: reason };
+function sendFailed(reason: string): TeamSendResult {
+  return { status: "failed", messageId: `teammsg_${randomUUID()}`, message: "Message was not delivered.", error: reason };
 }
 
 function taskFailed(

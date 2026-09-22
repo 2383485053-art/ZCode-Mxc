@@ -37,6 +37,12 @@ export function createTeamFileSystemGate(
 ): FileSystemPort {
   const assertWritable = (rawPath: string): void => {
     const policy = provider();
+    // reviewer 型成员（readOnly）：无树且只读——一切文件写被拒（设计 2.6）。
+    if (policy.readOnly === true) {
+      throw veto(
+        `You are a read-only teammate; file writes are disabled. Report findings with team_send instead of editing '${rawPath}'.`,
+      );
+    }
     if (policy.worktreePath === undefined) return;
     const worktree = resolve(policy.worktreePath);
     const target = resolve(rawPath);
