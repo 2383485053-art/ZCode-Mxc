@@ -27,6 +27,7 @@ import type {
   SkillPort,
   SubagentRunOptions,
   SubagentPort,
+  TeamPort,
   ToolArtifactStorePort,
   TraceContext,
   TurnId,
@@ -100,6 +101,7 @@ export interface ToolExecutorOptions {
   skillPort?: SkillPort;
   subagentPort?: SubagentPort;
   coordinatorResponsePort?: CoordinatorResponsePort;
+  teamPort?: TeamPort;
   workflowSubmitPort?: WorkflowSubmitPort;
   /** actor 的升级端口；存在即为该会话注册 escalate。 */
   workflowEscalatePort?: WorkflowEscalatePort;
@@ -204,6 +206,7 @@ export interface ToolExecutorDeps {
   skillPort?: SkillPort;
   subagentPort?: SubagentPort;
   coordinatorResponsePort?: CoordinatorResponsePort;
+  teamPort?: TeamPort;
   workflowSubmitPort?: WorkflowSubmitPort;
   /** actor 的升级端口；存在即为该会话注册 escalate。 */
   workflowEscalatePort?: WorkflowEscalatePort;

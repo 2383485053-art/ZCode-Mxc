@@ -24,6 +24,7 @@ export * from "./plan-mode.js";
 export * from "./ask-user-question.js";
 export * from "./send-message.js";
 export * from "./respond-to-coordinator.js";
+export * from "./team-send.js";
 export * from "./task-output.js";
 export * from "./task-stop.js";
 export * from "./read-session-context.js";
