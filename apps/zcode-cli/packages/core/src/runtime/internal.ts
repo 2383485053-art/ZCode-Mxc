@@ -101,6 +101,8 @@ export interface AgentRuntimeInternal
   mcpInitialized: boolean;
   mcpToolsRegistered: boolean;
   subagentPort?: SubagentPort;
+  /** Agent Teams lead 句柄（M3 O8：rewind 后的团队重置广播）。成员 runtime 恒缺席。 */
+  teamPort?: AgentRuntimeDeps["teamPort"];
   dynamicWorkflowRunPort?: DynamicWorkflowRunPort;
   modelCatalogPort?: ModelCatalogPort;
   runtimeTaskRegistry: RuntimeTaskRegistry;

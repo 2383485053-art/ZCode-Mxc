@@ -179,6 +179,7 @@ export class AgentRuntime {
   private subagentPort?: SubagentPort;
   private dynamicWorkflowRunPort?: DynamicWorkflowRunPort;
   private modelCatalogPort?: ModelCatalogPort;
+  private teamPort?: AgentRuntimeDeps["teamPort"];
   private runtimeTaskRegistry: RuntimeTaskRegistry;
   private branchGeneration = 0;
   private artifactStore?: ToolArtifactStorePort;
@@ -294,6 +295,8 @@ export class AgentRuntime {
     this.pdfDocumentPort = deps.pdfDocumentPort;
     this.subagentPort = deps.subagentPort ?? runtime.createDefaultSubagentPort(deps);
     this.dynamicWorkflowRunPort = deps.dynamicWorkflowRunPort;
+    // Agent Teams lead 稳定句柄（M3 O8）：rewind 提交后的团队重置广播从这里触达 TeamManager。
+    this.teamPort = deps.teamPort;
     // GUI「配置」解析子代理模型用的目录（与工具上下文拿的是同一个端口）。
     this.modelCatalogPort = deps.modelCatalogPort;
     this.registry = deps.toolRegistry ?? createToolRegistry();

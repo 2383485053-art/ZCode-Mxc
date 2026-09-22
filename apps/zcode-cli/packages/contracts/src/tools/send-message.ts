@@ -33,7 +33,9 @@ export const SendMessageOutputSchema = z
     status: z.enum(["success", "failed"]),
     messageId: z.string(),
     agentId: z.string().optional(),
-    delivery: z.enum(["queued", "steered", "resumed_background"]).optional(),
+    // 与 SubagentSendMessageDelivery 同源；本工具自身不传 interrupt，interrupted 只会
+    // 出现在团队路由侧，但输出类型与端口结果共型。
+    delivery: z.enum(["queued", "steered", "resumed_background", "interrupted"]).optional(),
     error: z.string().optional(),
     message: z.string().optional(),
     outputFile: z.string().optional(),

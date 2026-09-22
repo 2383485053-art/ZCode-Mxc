@@ -2,10 +2,13 @@
    单 writer 单进程的 M1 边界先在这里稳定（roster/看板/投递共享同一份内存真相与落盘节奏），
    M2/M3 引入跨进程与 hooks 时再按职责拆分。 */
 import { randomUUID } from "node:crypto";
+import { rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import type {
   LeadTeamPort,
   Logger,
+  TeamAdoptRequest,
+  TeamAdoptResult,
   TeamCollectRequest,
   TeamCollectResult,
   TeamCreateRequest,
@@ -15,6 +18,8 @@ import type {
   TeamDeliveryTarget,
   TeamHookTarget,
   TeamHookNotification,
+  TeamInboxFile,
+  TeamLeadInboxTarget,
   TeamMergeRejection,
   TeamMergeRequest,
   TeamMergeResult,
@@ -23,6 +28,7 @@ import type {
   TeamMemberRegistration,
   TeamMemberWorkspaceResult,
   TeamMemberWritePolicy,
+  TeamPendingMessage,
   TeamPort,
   TeamRosterResult,
   TeamSendResult,
@@ -40,8 +46,9 @@ import {
   TEAM_COLLECT_DEFAULT_TIMEOUT_MS,
   TEAM_COLLECT_MAX_TIMEOUT_MS,
   TEAM_COLLECT_MIN_TIMEOUT_MS,
+  createTraceId,
 } from "@zcode/contracts";
-import { commitAll, createWorktree, diffFiles, isCheckoutDirty, isGitRepository, isWorktreeDirty, mergeBaseOf, mergeBranch, removeWorktree, runGit } from "./team-git.js";
+import { attachWorktree, commitAll, createWorktree, diffFiles, isCheckoutDirty, isGitRepository, isWorktreeDirty, mergeBaseOf, mergeBranch, removeWorktree, runGit } from "./team-git.js";
 import { matchesAnyScope } from "./team-write-policy.js";
 import { isPidAlive, TeamStore, TeamStoreError } from "./team-store.js";
 
@@ -49,6 +56,14 @@ import { isPidAlive, TeamStore, TeamStoreError } from "./team-store.js";
 const DEFAULT_MAX_TEAMMATES = 5;
 
 const COLLECT_POLL_INTERVAL_MS = 500;
+
+/** M3 细粒度配额（设计 2.4，grok 验证设计 4/32/32KiB）：单条消息上限、单对在途上限、
+ * 单信箱在途容量上限。在途 = 信箱里无 deliveredAt 的条目；拒绝发生在写入之前。 */
+const TEAM_MESSAGE_MAX_BYTES = 32 * 1024;
+const TEAM_PAIR_INFLIGHT_MAX = 4;
+const TEAM_INBOX_INFLIGHT_MAX = 32;
+/** M3 文件信箱轮询后端周期（设计 2.4：lead 信箱注入 + run 级 TeammateIdle 检测）。 */
+const TEAM_INBOX_POLL_INTERVAL_MS = 500;
 
 /** 终态判定：completed/cancelled 之后看板条目不可再改（设计 2.5）。 */
 function isTaskTerminal(status: TeamTask["status"]): boolean {
@@ -82,8 +97,12 @@ function scopePrefix(glob: string): string {
  * 存续；跨进程互斥由磁盘上的 leadPid 活性判定兜底。
  *
  * 投递（通信层下半场）：成员收件经装配的 TeamDeliveryTarget 送进 lead 进程的子代理任务
- * 注册表——busy 成员 steer 进活跃 turn，idle 成员带消息后台复活；lead 收件恒 queued
- * （主会话无任务可 steer，镜像即全部）。
+ * 注册表——busy 成员 steer 进活跃 turn，idle 成员带消息后台复活；lead 收件入队信箱
+ * （M3 轮询后端 500ms 注入 lead 的活跃 turn；信箱条目带 deliveredAt 消费语义，未消费
+ * 条目跨崩溃/接管经复活简报补送）。
+ *
+ * 配额（M3，设计 2.4 的 4/32/32KiB）：单条 32KiB、单对在途 4、单箱在途 32——死信箱
+ * 对发送方形成背压。
  *
  * 看板（设计 2.5）：内存是唯一真相（M1 无接管读方），board.json 是 best-effort 镜像；
  * caller 身份由端口闭包绑定——成员只能认领（unowned pending → in_progress）/完成/归还自己的
@@ -102,6 +121,12 @@ export class TeamManager {
   private deliveryTarget: TeamDeliveryTarget | undefined;
   private memberControl: TeamMemberControlTarget | undefined;
   private teamHook: TeamHookTarget | undefined;
+  private leadInboxTarget: TeamLeadInboxTarget | undefined;
+  private inboxTimer: ReturnType<typeof setInterval> | undefined;
+  private pollTicking = false;
+  private injectFailureStreak = 0;
+  /** run 级 TeammateIdle 去重：成员重新 running 即清零（见 detectMemberIdle）。 */
+  private readonly idleNotified = new Set<string>();
 
   constructor(
     private readonly store: TeamStore,
@@ -125,6 +150,11 @@ export class TeamManager {
   /** 装配期挂团队 hooks 触发钩子（TaskCompleted/TeammateIdle，通知型）。 */
   attachTeamHook(target: TeamHookTarget | undefined): void {
     this.teamHook = target;
+  }
+
+  /** 装配期挂 lead 信箱注入钩子（M3 轮询后端：bootstrap 包 runtime.steerTurn）。 */
+  attachLeadInbox(target: TeamLeadInboxTarget | undefined): void {
+    this.leadInboxTarget = target;
   }
 
   /** 通知型 hook：失败只告警，绝不影响业务应答（fire-and-forget）。 */
@@ -181,6 +211,7 @@ export class TeamManager {
       this.roster = [];
       this.tasks = [];
       this.nextTaskId = 1;
+      this.startInboxPolling();
       this.logger?.info?.("Team created", { module: "core.agent.team", team: request.name });
       return {
         status: "success",
@@ -236,6 +267,7 @@ export class TeamManager {
       }
       await this.store.archiveTeam(name);
       await runGit(this.workspaceRoot, ["worktree", "prune"]);
+      this.stopInboxPolling();
       this.active = undefined;
       this.roster = [];
       this.tasks = [];
@@ -254,6 +286,180 @@ export class TeamManager {
     }
   }
 
+  /**
+   * 接管（M3，设计 2.3/2.9 验收「杀 lead → 新会话接管继续」）：原 lead 进程死亡后，
+   * 本会话收编磁盘团队——世代 +1 换 lead 身份、成员全标死亡（agentId 随旧进程作废，
+   * worktree 保留）、释放成员 in_progress 任务、看板与信箱原样入内存。活 pid 拒绝；
+   * completed 未合流任务保留 owner（merge gate 按 owner 认分支）。
+   */
+  async adoptTeam(request: TeamAdoptRequest): Promise<TeamAdoptResult> {
+    if (this.active) {
+      return adoptFailed(
+        `Team '${this.active.name}' is already active. Delete it before adopting another.`,
+      );
+    }
+    try {
+      const config = await this.store.readConfig(request.name);
+      if (isPidAlive(config.leadPid)) {
+        return adoptFailed(
+          `Team '${request.name}' is still active in another session (pid ${config.leadPid}). Use it there, or delete it first.`,
+        );
+      }
+      const board = await this.store.readBoard(request.name);
+      const members: TeamMember[] = config.members.map((member) => ({
+        ...member,
+        agentId: undefined,
+        state: "stopped" as const,
+      }));
+      const generation = config.generation + 1;
+      await this.store.writeConfig(request.name, {
+        ...config,
+        members,
+        leadSessionId: this.leadSessionId,
+        leadPid: process.pid,
+        generation,
+      });
+      this.active = { name: request.name, generation };
+      this.roster = members;
+      this.tasks = board.tasks;
+      this.nextTaskId = board.nextId;
+      let releasedTasks = 0;
+      for (const member of members) {
+        releasedTasks += this.releaseOwnedTasks(member.name);
+      }
+      if (releasedTasks > 0) {
+        await this.persistBoard();
+      }
+      // 在途消息盘点：lead 的经轮询注入；成员的在复活简报补送（不在此消费）。
+      let pendingMessages = 0;
+      for (const boxOwner of ["lead", ...members.map((member) => member.name)]) {
+        const inbox = await this.readInboxState(boxOwner);
+        pendingMessages += inbox.messages.filter((message) => message.deliveredAt === undefined)
+          .length;
+      }
+      this.startInboxPolling();
+      this.logger?.info?.("Team adopted", {
+        module: "core.agent.team",
+        team: request.name,
+        generation,
+        adoptedMembers: members.length,
+        releasedTasks,
+      });
+      return {
+        status: "success",
+        teamName: request.name,
+        generation,
+        adoptedMembers: members.length,
+        releasedTasks,
+        pendingMessages,
+        message:
+          `Team '${request.name}' adopted (generation ${generation}). ` +
+          `${members.length} teammate(s) marked dead — revive each with team_spawn_teammate using the same name.` +
+          (releasedTasks > 0
+            ? ` ${releasedTasks} task(s) were released back to the board.`
+            : "") +
+          (pendingMessages > 0
+            ? ` ${pendingMessages} undelivered message(s) preserved: yours will be injected into your next turn; teammates' replay on revival.`
+            : ""),
+      };
+    } catch (error) {
+      return adoptFailed(`Team adoption failed: ${errorMessage(error)}`);
+    }
+  }
+
+  /** 复活补送读取（M3）：成员信箱在途消息（不消费——消费在 spawn 确认后显式标记）。 */
+  async readMemberPendingMessages(memberName: string): Promise<TeamPendingMessage[]> {
+    if (!this.active) return [];
+    const inbox = await this.readInboxState(memberName);
+    return inbox.messages
+      .filter((message) => message.deliveredAt === undefined)
+      .map(({ messageId, from, summary, message, queuedAt }) => ({
+        messageId,
+        from,
+        summary,
+        message,
+        queuedAt,
+      }));
+  }
+
+  async markMemberMessagesDelivered(memberName: string, messageIds: string[]): Promise<void> {
+    if (!this.active || messageIds.length === 0) return;
+    try {
+      await this.store.markInboxDelivered(this.active.name, memberName, messageIds);
+    } catch (error) {
+      this.logger?.warn?.("Team inbox replay-mark failed", {
+        module: "core.agent.team",
+        team: this.active.name,
+        member: memberName,
+        error: errorMessage(error),
+      });
+    }
+  }
+
+  /**
+   * rewind 团队重置广播（M3，O8 另半边）：lead rewind 已由 runtime 停掉 removed-turn 的
+   * 成员任务并 bump branchGeneration（迟到回话被挡）。这里的重置 = 通知而非回滚：
+   * 运行中成员 steer 一条「lead 已 rewind，看板为准」；已停成员信箱留在途通知（下次
+   * 唤醒补送，不花钱自动复活）；lead 信箱留一条回执（轮询注入）。任务不强制释放——
+   * 被打断成员的 in_progress 由 collect 入口的清扫决定归还。
+   */
+  async resetTeamAfterRewind(): Promise<void> {
+    if (!this.active) return;
+    const notice =
+      "Team reset: the lead rewound its conversation to an earlier point. The task board remains authoritative — re-sync with task_list before assuming anything the lead said earlier still holds.";
+    let steered = 0;
+    let queued = 0;
+    for (const member of this.roster) {
+      if (member.state === "spawning") continue;
+      let running = false;
+      if (member.agentId !== undefined && this.memberControl) {
+        try {
+          running = (await this.memberControl.getAgentStatus(member.agentId)) === "running";
+        } catch {
+          running = false;
+        }
+      }
+      if (running) {
+        const delivered = await this.route("lead", member.name, {
+          summary: "team reset after lead rewind",
+          message: notice,
+          trace: { traceId: createTraceId(), spanId: "team-reset" },
+        });
+        if (delivered.status === "success") {
+          steered += 1;
+          continue;
+        }
+        // route() 先写后投递：投递失败时通知已在成员信箱（在途，下次唤醒补送），
+        // 不再重复入箱——配额拒绝等写前失败的极端情况少一条通知，可接受。
+        queued += 1;
+        continue;
+      }
+      await this.enqueueInbox(member.name, {
+        messageId: `teammsg_${randomUUID()}`,
+        from: "lead",
+        to: member.name,
+        summary: "team reset after lead rewind",
+        message: notice,
+        queuedAt: new Date().toISOString(),
+      });
+      queued += 1;
+    }
+    await this.enqueueInbox("lead", {
+      messageId: `teammsg_${randomUUID()}`,
+      from: "lead",
+      to: "lead",
+      summary: "team reset broadcast issued",
+      message: `Team reset after rewind: ${steered} running teammate(s) steered, ${queued} offline teammate(s) queued for next wake.`,
+      queuedAt: new Date().toISOString(),
+    });
+    this.logger?.info?.("Team reset broadcast after rewind", {
+      module: "core.agent.team",
+      team: this.active.name,
+      steered,
+      queued,
+    });
+  }
+
   async reserveMember(registration: TeamMemberRegistration): Promise<TeamRosterResult> {
     if (!this.active) {
       return rosterFailed("No active team. Create a team first with team_create.");
@@ -261,21 +467,54 @@ export class TeamManager {
     if (registration.name === "lead") {
       return rosterFailed("'lead' is reserved for the lead; pick another teammate name.");
     }
-    if (this.roster.some((member) => member.name === registration.name)) {
-      return rosterFailed(`Teammate '${registration.name}' already exists.`);
+    let revival = false;
+    const existing = this.roster.find((member) => member.name === registration.name);
+    if (existing !== undefined) {
+      // M3 复活：stopped/failed 成员同名重 spawn（复用 worktree 与信箱在途消息）；
+      // 其余状态（spawning/idle/busy）仍是重名拒绝。
+      if (existing.state !== "stopped" && existing.state !== "failed") {
+        return rosterFailed(`Teammate '${registration.name}' already exists.`);
+      }
+      revival = true;
+      const heldWorktree = existing.worktreePath;
+      this.roster = this.roster.filter((member) => member.name !== registration.name);
+      this.roster.push({
+        name: registration.name,
+        profile: registration.profile ?? existing.profile,
+        readOnly: registration.readOnly ?? existing.readOnly,
+        maxTurns: registration.maxTurns ?? existing.maxTurns,
+        state: "spawning",
+        // 复用旧树（setupMemberWorkspace 走 attach 路径）；转成 readOnly 复活则弃树。
+        ...(heldWorktree !== undefined && registration.readOnly !== true
+          ? { worktreePath: heldWorktree }
+          : {}),
+      });
+      if (heldWorktree !== undefined && registration.readOnly === true) {
+        const removed = await removeWorktree(this.workspaceRoot, heldWorktree);
+        if (!removed.ok) {
+          this.logger?.warn?.("Revival worktree reclaim failed; left for manual cleanup", {
+            module: "core.agent.team",
+            team: this.active.name,
+            member: registration.name,
+            worktreePath: heldWorktree,
+            error: removed.error,
+          });
+        }
+      }
+    } else {
+      if (this.roster.length >= this.maxTeammates) {
+        return rosterFailed(
+          `Team is full (${this.maxTeammates} teammates; adjust settings key team.maxTeammates). Finish work before spawning more.`,
+        );
+      }
+      this.roster.push({
+        name: registration.name,
+        ...(registration.profile ? { profile: registration.profile } : {}),
+        ...(registration.readOnly !== undefined ? { readOnly: registration.readOnly } : {}),
+        ...(registration.maxTurns !== undefined ? { maxTurns: registration.maxTurns } : {}),
+        state: "spawning",
+      });
     }
-    if (this.roster.length >= this.maxTeammates) {
-      return rosterFailed(
-        `Team is full (${this.maxTeammates} teammates; adjust settings key team.maxTeammates). Finish work before spawning more.`,
-      );
-    }
-    this.roster.push({
-      name: registration.name,
-      ...(registration.profile ? { profile: registration.profile } : {}),
-      ...(registration.readOnly !== undefined ? { readOnly: registration.readOnly } : {}),
-      ...(registration.maxTurns !== undefined ? { maxTurns: registration.maxTurns } : {}),
-      state: "spawning",
-    });
     const persistError = await this.persistRoster();
     if (persistError) {
       this.roster = this.roster.filter((member) => member.name !== registration.name);
@@ -286,7 +525,9 @@ export class TeamManager {
       teamName: this.active.name,
       memberName: registration.name,
       roster: [...this.roster],
-      message: `Teammate '${registration.name}' reserved.`,
+      message: revival
+        ? `Teammate '${registration.name}' reserved for revival (worktree and queued messages are kept).`
+        : `Teammate '${registration.name}' reserved.`,
     };
   }
 
@@ -304,7 +545,9 @@ export class TeamManager {
     if (persistError) {
       return rosterFailed(`Teammate spawn could not be persisted: ${persistError}`, memberName);
     }
-    // 成员就绪即可派活——TeammateIdle 通知型 hook（设计 2.7）。
+    // 成员就绪即可派活——TeammateIdle 通知型 hook（设计 2.7）。spawn 是新的空闲收束：
+    // 清去重再通知（成员可能带着旧标记重入名册）。
+    this.idleNotified.delete(memberName);
     this.notifyTeamHook({
       hookEventName: "TeammateIdle",
       memberName,
@@ -394,7 +637,33 @@ export class TeamManager {
       return workspaceFailed(`Teammate '${memberName}' is not on the roster.`);
     }
     if (member.worktreePath !== undefined) {
-      return workspaceFailed(`Teammate '${memberName}' already has a worktree.`);
+      // M3 复活重挂：占位条目带着旧树路径（reserveMember 复用）——目录在则原样复用；
+      // 目录被删则把既有分支挂回去。树损（.git 指针没了）按目录已删处理。
+      if (!(await isGitRepository(this.workspaceRoot))) {
+        return workspaceFailed(
+          `Writer teammates need a git repository at '${this.workspaceRoot}'. ` +
+            "Spawn readOnly teammates in non-git projects, or git init first.",
+        );
+      }
+      const branch = `zcode-team/${this.active.name}/${memberName}`;
+      let worktreeIntact = false;
+      try {
+        worktreeIntact = (await stat(join(member.worktreePath, ".git"))).isFile();
+      } catch {
+        worktreeIntact = false;
+      }
+      if (!worktreeIntact) {
+        await rm(member.worktreePath, { recursive: true, force: true });
+        const attached = await attachWorktree(this.workspaceRoot, member.worktreePath, branch);
+        if (!attached.ok) {
+          return workspaceFailed(attached.error);
+        }
+      }
+      return {
+        status: "success",
+        workspace: { worktreePath: member.worktreePath, branch },
+        message: `Teammate '${memberName}' worktree reused at ${member.worktreePath}.`,
+      };
     }
     if (!(await isGitRepository(this.workspaceRoot))) {
       return workspaceFailed(
@@ -517,19 +786,42 @@ export class TeamManager {
       message: request.message,
       queuedAt: new Date().toISOString(),
     };
-    // lead 收件：无任务可 steer，入队即结局；成员收件：必须等到 steer/复活的实际结局。
+    // M3 细粒度配额（4/32/32KiB）：检查先于写入——被拒的消息不落信箱。在途 = 无
+    // deliveredAt 的条目；死信箱对发送方形成背压（等收件方消费或复活补送）。
+    const payloadBytes = Buffer.byteLength(`${request.summary}\n${request.message}`, "utf8");
+    if (payloadBytes > TEAM_MESSAGE_MAX_BYTES) {
+      return sendFailed(
+        `Message too large: ${payloadBytes} bytes (limit ${TEAM_MESSAGE_MAX_BYTES}). Split it or send a file path instead.`,
+      );
+    }
+    const inbox = await this.readInboxState(to);
+    const inflight = inbox.messages.filter((message) => message.deliveredAt === undefined);
+    const pairInflight = inflight.filter((message) => message.from === from).length;
+    if (pairInflight >= TEAM_PAIR_INFLIGHT_MAX) {
+      return sendFailed(
+        `Cannot send to '${to}': ${pairInflight} of your messages are still in flight there (limit ${TEAM_PAIR_INFLIGHT_MAX}). Wait for pickup first.`,
+      );
+    }
+    if (inflight.length >= TEAM_INBOX_INFLIGHT_MAX) {
+      return sendFailed(
+        `Cannot send to '${to}': their inbox already holds ${inflight.length} undelivered message(s) (limit ${TEAM_INBOX_INFLIGHT_MAX}).`,
+      );
+    }
+    // M3 先写后投递：条目先落盘（在途），投递结局达成后标记消费——中途崩溃或接管时，
+    // 未消费条目经轮询注入（lead）或复活简报补送（成员）不丢消息。
+    await this.enqueueInbox(to, entry);
+    // lead 收件：无任务可 steer，入队即结局；轮询后端 500ms 内注入 lead 的活跃 turn。
     if (to === "lead") {
-      void this.mirrorAppend(to, entry);
       return {
         status: "success",
         messageId,
-        message: `Message queued for lead.`,
+        message: "Message queued for lead.",
         delivery: "queued",
       };
     }
     if (!this.deliveryTarget) {
       return sendFailed(
-        `Teammate '${to}' cannot receive messages: delivery is unavailable (subagents disabled?).`,
+        `Teammate '${to}' cannot receive messages right now: delivery is unavailable (subagents disabled?). The message stays in their inbox and will be replayed when they are revived.`,
       );
     }
     // 投递键是 agentId：lead 进程的任务注册表按它索引（成员名仅作镜像/报错身份）。
@@ -542,17 +834,21 @@ export class TeamManager {
         summary: request.summary,
         message: request.message,
         trace: request.trace,
+        ...(request.delivery === "interject" ? { interrupt: true } : {}),
       },
     );
     if (delivered.status === "failed") {
+      const reviveHint =
+        toMember !== undefined && toMember.agentId === undefined
+          ? ` Teammate '${to}' has no live agent; the message stays queued in their inbox and will replay when you revive them (team_spawn_teammate '${to}').`
+          : "";
       return sendFailed(
-        `Delivery to teammate '${to}' failed: ${delivered.error ?? delivered.message ?? "unknown error"}`,
+        `Delivery to teammate '${to}' failed: ${delivered.error ?? delivered.message ?? "unknown error"}.${reviveHint}`,
       );
     }
-    // 镜像写入是 async 的，投递结局达成后 fire-and-forget + 失败日志：镜像丢失不回滚应答。
-    void this.mirrorAppend(to, entry);
+    void this.markDelivered(to, messageId);
     if (from !== "lead") {
-      void this.mirrorAppend("lead", {
+      void this.enqueueInbox("lead", {
         ...entry,
         messageId: `${messageId}_cc`,
         summary: `[cc-lead] ${from} → ${to}: ${request.summary}`,
@@ -564,11 +860,13 @@ export class TeamManager {
       status: "success",
       messageId,
       message:
-        delivery === "resumed_background"
-          ? `Teammate '${to}' was idle; resumed in the background with your message.`
-          : delivery === "steered"
-            ? `Message delivered into the active turn of teammate '${to}'.`
-            : `Message queued for ${to}.`,
+        delivery === "interrupted"
+          ? `Interrupted teammate '${to}'s active run and resumed it with your message.`
+          : delivery === "resumed_background"
+            ? `Teammate '${to}' was idle; resumed in the background with your message.`
+            : delivery === "steered"
+              ? `Message delivered into the active turn of teammate '${to}'.`
+              : `Message queued for ${to}.`,
       delivery,
     };
   }
@@ -803,12 +1101,9 @@ export class TeamManager {
         teamName: this.active.name,
       });
       // 完成回包提示过下一步可认领；无活可干即空闲——TeammateIdle 通知（设计 2.7）。
+      // 与轮询器共用 fireTeammateIdleOnce 去重：同一次空闲收束只通知一次。
       if (this.claimableTasks().length === 0 && task.owner !== undefined) {
-        this.notifyTeamHook({
-          hookEventName: "TeammateIdle",
-          memberName: task.owner,
-          teamName: this.active.name,
-        });
+        this.fireTeammateIdleOnce(task.owner);
       }
     }
     return {
@@ -830,7 +1125,7 @@ export class TeamManager {
     // 名册 → 除名并释放任务，否则下述等待会被「永远 in_progress」的任务拖死。
     const swept = await this.sweepZombieMembers();
     const sweepNote =
-      swept.length > 0 ? ` Released stalled member(s): ${swept.join(", ")}.` : "";
+      swept.length > 0 ? ` Dead member(s): ${swept.join("; ")}.` : "";
     const timeoutMs = Math.min(
       Math.max(request.timeoutMs ?? TEAM_COLLECT_DEFAULT_TIMEOUT_MS, TEAM_COLLECT_MIN_TIMEOUT_MS),
       TEAM_COLLECT_MAX_TIMEOUT_MS,
@@ -1057,8 +1352,8 @@ export class TeamManager {
    */
   private async sweepZombieMembers(): Promise<string[]> {
     if (!this.memberControl || !this.active) return [];
-    const removed: string[] = [];
-    // 同 deleteTeam：removeMember 重赋值 roster，for-of 持旧引用稳定。
+    const notes: string[] = [];
+    // 同 deleteTeam：removeMember 重赋值 roster，for-of 持旧引用稳定；这里只改字段不移除。
     for (const member of this.roster) {
       if (member.agentId === undefined) continue;
       let status: Awaited<ReturnType<TeamMemberControlTarget["getAgentStatus"]>>;
@@ -1067,21 +1362,38 @@ export class TeamManager {
       } catch {
         continue;
       }
-      if (status === "failed" || status === "missing") {
-        const result = await this.removeMember(member.name, `member task ${status} (zombie sweep)`);
-        if (result.status === "success") {
-          removed.push(member.name);
-          this.logger?.warn?.("Zombie teammate swept", {
-            module: "core.agent.team",
-            team: this.active.name,
-            member: member.name,
-            agentId: member.agentId,
-            taskStatus: status,
-          });
-        }
+      if (status !== "failed" && status !== "missing") continue;
+      // M3 死亡标记（取代 M1 的除名）：任务释放 + 人与 worktree 保留。
+      // failed = 进程内任务终态但注册表还在——agentId 留着，sendMessage 仍可复活；
+      // missing = 注册表查无——agentId 作废，只能同名重 spawn 复活（在途消息补送）。
+      const priorState = member.state;
+      const released = this.releaseOwnedTasks(member.name);
+      member.state = status === "missing" ? "stopped" : "failed";
+      if (status === "missing") {
+        member.agentId = undefined;
       }
+      if (released > 0) {
+        await this.persistBoard();
+      }
+      const changed = priorState !== member.state || released > 0;
+      if (!changed) continue;
+      const persistError = await this.persistRoster();
+      if (persistError) {
+        notes.push(`${member.name}: mark ${member.state} failed to persist (${persistError})`);
+        continue;
+      }
+      this.logger?.warn?.("Teammate marked dead", {
+        module: "core.agent.team",
+        team: this.active.name,
+        member: member.name,
+        taskStatus: status,
+        releasedTasks: released,
+      });
+      notes.push(
+        `${member.name} marked ${member.state}${released > 0 ? `, ${released} task(s) released` : ""}; revive with team_spawn_teammate`,
+      );
     }
-    return removed;
+    return notes;
   }
 
   private validateStatusTransition(
@@ -1207,7 +1519,8 @@ export class TeamManager {
     return open.length > 0 ? open : "(none)";
   }
 
-  private async mirrorAppend(
+  /** M3 信箱写入（原 M1 镜像）：在途条目落盘即真相，失败告警不阻断应答。 */
+  private async enqueueInbox(
     to: string,
     entry: Parameters<TeamStore["appendInboxMessage"]>[2],
   ): Promise<void> {
@@ -1215,13 +1528,154 @@ export class TeamManager {
     try {
       await this.store.appendInboxMessage(this.active.name, to, entry);
     } catch (error) {
-      this.logger?.warn?.("Team inbox mirror write failed", {
+      this.logger?.warn?.("Team inbox write failed", {
         module: "core.agent.team",
         team: this.active.name,
         messageId: entry.messageId,
         error: errorMessage(error),
       });
     }
+  }
+
+  private async readInboxState(member: string): Promise<TeamInboxFile> {
+    if (!this.active) return { schemaVersion: 1, messages: [] };
+    return this.store.readInbox(this.active.name, member);
+  }
+
+  /** 投递结局达成后标消费（best-effort；失败只在途多留一条，复活补送兜底）。 */
+  private async markDelivered(member: string, ...messageIds: string[]): Promise<void> {
+    if (!this.active || messageIds.length === 0) return;
+    try {
+      await this.store.markInboxDelivered(this.active.name, member, messageIds);
+    } catch (error) {
+      this.logger?.warn?.("Team inbox delivered-mark failed", {
+        module: "core.agent.team",
+        team: this.active.name,
+        member,
+        error: errorMessage(error),
+      });
+    }
+  }
+
+  // ============================================================
+  // M3 轮询后端（设计 2.4：500ms 文件信箱轮询是跨进程/崩溃后的消费行为）
+  // ============================================================
+
+  private startInboxPolling(): void {
+    if (this.inboxTimer !== undefined) return;
+    this.inboxTimer = setInterval(() => void this.pollTick(), TEAM_INBOX_POLL_INTERVAL_MS);
+    // 不阻止进程退出：无团队时 tick 自空转，进程退出随事件循环收尾。
+    this.inboxTimer.unref?.();
+  }
+
+  private stopInboxPolling(): void {
+    if (this.inboxTimer === undefined) return;
+    clearInterval(this.inboxTimer);
+    this.inboxTimer = undefined;
+    this.injectFailureStreak = 0;
+    this.idleNotified.clear();
+  }
+
+  private async pollTick(): Promise<void> {
+    if (this.pollTicking || !this.active) return;
+    this.pollTicking = true;
+    const team = this.active.name;
+    try {
+      await this.pumpLeadInbox(team);
+      await this.detectMemberIdle();
+    } catch (error) {
+      this.logger?.warn?.("Team inbox poll failed", {
+        module: "core.agent.team",
+        team,
+        error: errorMessage(error),
+      });
+    } finally {
+      this.pollTicking = false;
+    }
+  }
+
+  /**
+   * lead 信箱泵：在途消息合并成一条合成输入，经注入钩子进 lead 的活跃 turn（工具
+   * 边界 steer，与成员收件同款原语）。无活跃 turn 时留在信箱下一轮再试——节流日志
+   * 防刷屏。注入成功即标消费。
+   */
+  private async pumpLeadInbox(team: string): Promise<void> {
+    if (this.leadInboxTarget === undefined) return;
+    const inbox = await this.store.readInbox(team, "lead");
+    const pending = inbox.messages.filter((message) => message.deliveredAt === undefined);
+    if (pending.length === 0) {
+      this.injectFailureStreak = 0;
+      return;
+    }
+    const text = pending
+      .map((message) => `[team inbox] ${message.from} → lead\n${message.message}`)
+      .join("\n---\n");
+    let injected = false;
+    try {
+      injected = await this.leadInboxTarget.inject(text);
+    } catch (error) {
+      this.logger?.warn?.("Team lead inbox inject failed", {
+        module: "core.agent.team",
+        team,
+        error: errorMessage(error),
+      });
+    }
+    if (!injected) {
+      this.injectFailureStreak += 1;
+      if (this.injectFailureStreak % 20 === 1) {
+        this.logger?.info?.("Team lead inbox waiting for an active lead turn", {
+          module: "core.agent.team",
+          team,
+          pending: pending.length,
+        });
+      }
+      return;
+    }
+    this.injectFailureStreak = 0;
+    await this.markDelivered("lead", ...pending.map((message) => message.messageId));
+  }
+
+  /**
+   * run 级 TeammateIdle 精确触发（PR9 注记的补课）：成员任务收束（succeeded——上一轮
+   * 跑完可复活）且名下无 in_progress、看板无可认领任务 → 通知一次；任务重新 running
+   * 即清零去重。failed/missing 不算 idle（那是死亡/治理信号，清扫归 collect 入口）。
+   */
+  private async detectMemberIdle(): Promise<void> {
+    if (!this.active || this.memberControl === undefined) return;
+    for (const member of this.roster) {
+      if (member.agentId === undefined || member.state === "spawning") continue;
+      let status: Awaited<ReturnType<TeamMemberControlTarget["getAgentStatus"]>>;
+      try {
+        status = await this.memberControl.getAgentStatus(member.agentId);
+      } catch {
+        continue;
+      }
+      if (status === "running") {
+        this.idleNotified.delete(member.name);
+        continue;
+      }
+      if (status !== "succeeded" || this.idleNotified.has(member.name)) continue;
+      const holdsTask = this.tasks.some(
+        (task) => task.owner === member.name && task.status === "in_progress",
+      );
+      if (holdsTask || this.claimableTasks().length > 0) continue;
+      this.fireTeammateIdleOnce(member.name);
+    }
+  }
+
+  /**
+   * TeammateIdle 统一去重点（M3）：updateTask 完成路径、spawn 就绪路径与轮询器三处
+   * 共用——同一次空闲收束只通知一次；成员任务重新 running 时由轮询器清零。
+   * spawn 就绪路径是「新收束」，调用前先 delete 再直接 notifyTeamHook。
+   */
+  private fireTeammateIdleOnce(memberName: string): void {
+    if (!this.active || this.idleNotified.has(memberName)) return;
+    this.idleNotified.add(memberName);
+    this.notifyTeamHook({
+      hookEventName: "TeammateIdle",
+      memberName,
+      teamName: this.active.name,
+    });
   }
 
   private async persistRoster(): Promise<string | undefined> {
@@ -1289,6 +1743,11 @@ export function createLeadTeamPort(manager: TeamManager): LeadTeamPort {
     createTask: (request) => manager.createTask(request),
     mergeTask: (request) => manager.mergeTask(request),
     collectTasks: (request, signal) => manager.collectTasks(request, signal),
+    adoptTeam: (request) => manager.adoptTeam(request),
+    readMemberPendingMessages: (memberName) => manager.readMemberPendingMessages(memberName),
+    markMemberMessagesDelivered: (memberName, messageIds) =>
+      manager.markMemberMessagesDelivered(memberName, messageIds),
+    resetTeamAfterRewind: () => manager.resetTeamAfterRewind(),
   };
 }
 
@@ -1337,6 +1796,10 @@ function mergeRejected(
 
 function sendFailed(reason: string): TeamSendResult {
   return { status: "failed", messageId: `teammsg_${randomUUID()}`, message: "Message was not delivered.", error: reason };
+}
+
+function adoptFailed(reason: string): TeamAdoptResult {
+  return { status: "failed", message: reason, error: reason };
 }
 
 function taskFailed(

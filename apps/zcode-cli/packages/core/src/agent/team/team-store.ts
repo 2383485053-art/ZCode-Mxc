@@ -136,25 +136,90 @@ export class TeamStore {
     );
   }
 
+  /**
+   * 看板读取（M3 接管路径）：文件不存在 = 空板；损坏 = 隔离报错（接管宁失败不可
+   * 静默清板——lead 人工处理 board.json 后重试）。
+   */
+  async readBoard(teamName: string): Promise<TeamBoardFile> {
+    const { boardPath } = this.location(teamName);
+    let raw: string;
+    try {
+      raw = await readFile(boardPath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return { schemaVersion: 1, nextId: 1, tasks: [] };
+      }
+      throw new TeamStoreError(`Cannot read ${boardPath}`, "io_error", error);
+    }
+    const parsed = TEAM_BOARD_FILE_SCHEMA.safeParse(JSON.parse(raw));
+    if (!parsed.success) {
+      throw new TeamStoreError(
+        `Team '${teamName}' board.json is invalid: ${parsed.error.message}`,
+        "config_invalid",
+      );
+    }
+    return parsed.data;
+  }
+
   async appendInboxMessage(
     teamName: string,
     member: string,
     entry: TeamInboxFile["messages"][number],
   ): Promise<void> {
-    const path = this.location(teamName).inboxPath(member);
-    let inbox: TeamInboxFile = { schemaVersion: 1, messages: [] };
-    try {
-      inbox = TEAM_INBOX_FILE_SCHEMA.parse(JSON.parse(await readFile(path, "utf8")));
-    } catch {
-      // 文件不存在 = 首条消息；已存在但损坏 = 重置镜像。进程内事件总线才是 M1 的消费方
-      // （设计 2.3），镜像重置不丢消息本体，只丢历史镜像。
-    }
+    const inbox = await this.readInboxRaw(teamName, member);
     inbox.messages.push(entry);
+    // M3 截尾规则：在途（无 deliveredAt）条目永不裁；已消费条目从尾部保留补齐到总数 50。
+    // 在途量由箱内容量配额（32）封顶，极端情况下数组仍 ≤ 50，schema 不破。保持时间顺序。
+    const inflightIds = new Set(
+      inbox.messages
+        .filter((message) => message.deliveredAt === undefined)
+        .map((message) => message.messageId),
+    );
     if (inbox.messages.length > 50) {
-      // 与投递队列同一条 50 上限（设计 2.4），镜像侧同步截尾防无界增长。
-      inbox.messages = inbox.messages.slice(-50);
+      const keepDeliveredIds = new Set(
+        inbox.messages
+          .filter((message) => message.deliveredAt !== undefined)
+          .slice(-(50 - inflightIds.size))
+          .map((message) => message.messageId),
+      );
+      inbox.messages = inbox.messages.filter(
+        (message) => inflightIds.has(message.messageId) || keepDeliveredIds.has(message.messageId),
+      );
     }
+    const path = this.location(teamName).inboxPath(member);
     await writeFile(path, `${JSON.stringify(inbox, null, 2)}\n`, "utf8");
+  }
+
+  /**
+   * 读信箱（M3 消费语义）。文件不存在 = 空箱；损坏 = 隔离重置（与 append 同款语义：
+   * 丢历史镜像不丢消息本体——在途消息的真相在投递结局应答里，已消费条目只是审计尾）。
+   */
+  async readInbox(teamName: string, member: string): Promise<TeamInboxFile> {
+    return this.readInboxRaw(teamName, member);
+  }
+
+  /** 批量标记消费（投递结局达成后调用；重写文件，best-effort 失败由调用方告警）。 */
+  async markInboxDelivered(teamName: string, member: string, messageIds: string[]): Promise<void> {
+    if (messageIds.length === 0) return;
+    const inbox = await this.readInboxRaw(teamName, member);
+    const ids = new Set(messageIds);
+    const deliveredAt = new Date().toISOString();
+    for (const message of inbox.messages) {
+      if (message.deliveredAt === undefined && ids.has(message.messageId)) {
+        message.deliveredAt = deliveredAt;
+      }
+    }
+    const path = this.location(teamName).inboxPath(member);
+    await writeFile(path, `${JSON.stringify(inbox, null, 2)}\n`, "utf8");
+  }
+
+  private async readInboxRaw(teamName: string, member: string): Promise<TeamInboxFile> {
+    const path = this.location(teamName).inboxPath(member);
+    try {
+      return TEAM_INBOX_FILE_SCHEMA.parse(JSON.parse(await readFile(path, "utf8")));
+    } catch {
+      return { schemaVersion: 1, messages: [] };
+    }
   }
 
   /**

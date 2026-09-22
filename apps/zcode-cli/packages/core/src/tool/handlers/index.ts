@@ -21,6 +21,7 @@ import {
   TEAM_COLLECT_TOOL_NAME,
   TEAM_CREATE_TOOL_NAME,
   TEAM_DELETE_TOOL_NAME,
+  TEAM_ADOPT_TOOL_NAME,
   TEAM_MERGE_TOOL_NAME,
   TEAM_SEND_TOOL_NAME,
   TEAM_SPAWN_TEAMMATE_TOOL_NAME,
@@ -65,6 +66,7 @@ import { respondToCoordinatorToolEntry } from "./respond-to-coordinator.js";
 import { teamSendToolEntry } from "./team-send.js";
 import { teamCreateToolEntry } from "./team-create.js";
 import { teamDeleteToolEntry } from "./team-delete.js";
+import { teamAdoptToolEntry } from "./team-adopt.js";
 import { teamSpawnTeammateToolEntry } from "./team-spawn-teammate.js";
 import { taskCreateToolEntry } from "./task-create.js";
 import { taskListToolEntry } from "./task-list.js";
@@ -120,6 +122,7 @@ export const builtInTools: ToolEntry[] = [
   // lead 生命周期与看板管理工具：与 team_send 不同门（includeTeamAdmin），只有 lead 句柄才注册。
   teamCreateToolEntry,
   teamDeleteToolEntry,
+  teamAdoptToolEntry,
   teamSpawnTeammateToolEntry,
   taskCreateToolEntry,
   teamCollectToolEntry,
@@ -280,6 +283,7 @@ export function registerBuiltInTools(
     if (
       (entry.metadata.name === TEAM_CREATE_TOOL_NAME ||
         entry.metadata.name === TEAM_DELETE_TOOL_NAME ||
+        entry.metadata.name === TEAM_ADOPT_TOOL_NAME ||
         entry.metadata.name === TEAM_SPAWN_TEAMMATE_TOOL_NAME ||
         entry.metadata.name === TASK_CREATE_TOOL_NAME ||
         entry.metadata.name === TEAM_COLLECT_TOOL_NAME ||

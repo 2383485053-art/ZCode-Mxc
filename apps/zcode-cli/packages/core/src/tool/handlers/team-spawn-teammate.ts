@@ -40,6 +40,7 @@ const TEAM_SPAWN_PROVIDER_DESCRIPTION = [
   "",
   "Teammates run in the background with a per-run turn budget (default 20). They receive team messages and can message the lead and each other via team_send. Keep teams small (3-5 is the sweet spot).",
   "Writers (readOnly not set) get their own git worktree (requires a git repository); readOnly teammates share the lead's checkout.",
+  "Revival: spawning with the name of a dead teammate (after lead takeover or a crash) revives them — the same worktree branch is re-attached and messages that arrived while they were dead are replayed into their briefing.",
 ].join("\n");
 
 interface SpawnFailure {
@@ -109,6 +110,19 @@ const teamSpawnTeammateHandler: ToolHandler = async (input, context) => {
     memberWorkspace = workspace.workspace;
   }
 
+  // M3 复活补送：同名重 spawn 的成员把信箱在途消息并入简报（新 spawn 是全新子会话，
+  // 旧投递结局对它无效）；消费标记在 spawn 确认后落——失败则消息留待下次复活再补送。
+  const pendingReplay = await lead.readMemberPendingMessages(parsed.name).catch(() => []);
+  const replayBriefing =
+    pendingReplay.length > 0
+      ? `\n\nMessages that arrived while you were away (replayed from your inbox, oldest first):\n${pendingReplay
+          .map(
+            (message) =>
+              `- from ${message.from} (${message.queuedAt}): ${message.summary}\n${message.message}`,
+          )
+          .join("\n")}`
+      : "";
+
   const briefing = [
     `You are teammate "${parsed.name}" on agent team "${reserve.teamName}".`,
     'Your lead is "lead". Task assignments and messages arrive as team messages; answer or report with team_send.',
@@ -122,6 +136,7 @@ const teamSpawnTeammateHandler: ToolHandler = async (input, context) => {
           "You have no separate worktree and share the lead's checkout: prefer read-only analysis (read/search/list) and report findings via team_send — direct edits would land unisolated in the shared checkout.",
         ]),
     "Teammates are resumed per message: finish your current instructions cleanly and stop; you will be woken when there is more to do.",
+    ...(replayBriefing !== "" ? [replayBriefing] : []),
   ].join("\n");
 
   try {
@@ -151,6 +166,13 @@ const teamSpawnTeammateHandler: ToolHandler = async (input, context) => {
         message: `Teammate spawned (agent ${output.agentId}) but roster confirmation failed: ${confirm.error ?? confirm.message}`,
         error: confirm.error ?? confirm.message,
       } satisfies TeamSpawnTeammateOutput;
+    }
+    // 复活补送的消费标记：spawn 确认成功才落（best-effort；失败只多留在途一条）。
+    if (pendingReplay.length > 0) {
+      await lead.markMemberMessagesDelivered(
+        parsed.name,
+        pendingReplay.map((message) => message.messageId),
+      );
     }
     return {
       status: "success",

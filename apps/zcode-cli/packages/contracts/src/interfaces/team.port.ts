@@ -53,7 +53,11 @@ export const TEAM_CONFIG_FILE_SCHEMA = z.object({
 });
 export type TeamConfigFile = z.infer<typeof TEAM_CONFIG_FILE_SCHEMA>;
 
-/** inboxes/{member}.json 的落盘形状：M1 是持久化镜像（消费方是进程内事件总线），不是轮询源。 */
+/**
+ * inboxes/{member}.json 的落盘形状。M3 起带消费语义：deliveredAt 缺席 = 在途未消费
+ * （lead 信箱由 500ms 轮询注入消费，成员信箱由投递成功或复活简报消费）；截尾只裁
+ * 已消费旧条目，在途条目永不裁（箱内 32 在途配额封顶，数组不超 50）。
+ */
 export const TEAM_INBOX_FILE_SCHEMA = z.object({
   schemaVersion: z.literal(1),
   messages: z
@@ -65,6 +69,7 @@ export const TEAM_INBOX_FILE_SCHEMA = z.object({
         summary: z.string(),
         message: z.string(),
         queuedAt: z.string().min(1),
+        deliveredAt: z.string().min(1).optional(),
       }),
     )
     .max(50),
@@ -205,14 +210,20 @@ export interface TeamSendMessage {
   summary: string;
   message: string;
   trace: TraceContext;
+  /**
+   * M3 interject：默认 auto（busy→steer 工具边界注入，idle→复活）；interject 打断
+   * 收件成员当前 run 并带消息原地续跑（abort + resume from store）。
+   */
+  delivery?: "auto" | "interject";
 }
 
 /**
  * 消息结局（设计 2.4：每条消息必有明确结局）。queued = 仅入队（收件人是 lead，
  * 或成员任务不在场由注册表排队）；steered = 已注入收件成员的活跃 turn；
- * resumed_background = 成员空闲，已带消息后台复活。
+ * resumed_background = 成员空闲，已带消息后台复活；interrupted = 成员 run 被打断
+ * （interject）并带消息原地续跑。
  */
-export type TeamDeliveryState = "queued" | "steered" | "resumed_background";
+export type TeamDeliveryState = "queued" | "steered" | "resumed_background" | "interrupted";
 
 export interface TeamSendResult {
   status: "success" | "failed";
@@ -241,8 +252,24 @@ export interface TeamDeliveryTargetRef {
 export interface TeamDeliveryTarget {
   sendMessage(
     target: TeamDeliveryTargetRef,
-    entry: { summary: string; message: string; trace: TraceContext },
+    entry: {
+      summary: string;
+      message: string;
+      trace: TraceContext;
+      /** M3 interject：打断收件成员当前 run 并带消息原地续跑（缺省 false）。 */
+      interrupt?: boolean;
+    },
   ): Promise<SubagentSendMessageResult>;
+}
+
+/**
+ * lead 信箱注入钩子（M3 轮询后端）：TeamManager 500ms 轮询 lead 信箱的在途消息，
+ * 经此钩子注入 lead 的活跃 turn（工具边界 steer）。返回 false = 当前无活跃 turn，
+ * 消息留在信箱下一轮再试。由装配层回填；缺席时 lead 信箱只积累（配额封顶），
+ * 等待 lead 侧自然消费（team_collect 报告/接管交接）。
+ */
+export interface TeamLeadInboxTarget {
+  inject(text: string): Promise<boolean>;
 }
 
 /**
@@ -286,6 +313,26 @@ export interface TeamDeleteRequest {
 export interface TeamDeleteResult {
   status: "success" | "failed";
   teamName?: string;
+  message: string;
+  error?: string;
+}
+
+/** 接管请求（M3）：按名收编磁盘上原 lead 已死亡的团队。 */
+export interface TeamAdoptRequest {
+  name: string;
+}
+
+/** 接管结果：收编统计进 message；成员全部标记死亡，复活走同名 team_spawn_teammate。 */
+export interface TeamAdoptResult {
+  status: "success" | "failed";
+  teamName?: string;
+  generation?: number;
+  /** 收编时名册里的成员数（全部已标死亡）。 */
+  adoptedMembers?: number;
+  /** 从死亡成员名下释放回 pending 的 in_progress 任务数。 */
+  releasedTasks?: number;
+  /** 全部信箱的在途消息数（lead 的经轮询注入，成员的在复活时补送）。 */
+  pendingMessages?: number;
   message: string;
   error?: string;
 }
@@ -387,6 +434,34 @@ export interface LeadTeamPort extends TeamPort {
   mergeTask(request: TeamMergeRequest): Promise<TeamMergeResult>;
   /** 合流等待（ACL：仅 lead；等非终态任务到达终态，超时带部分结果）。 */
   collectTasks(request: TeamCollectRequest, signal?: AbortSignal): Promise<TeamCollectResult>;
+  /**
+   * 接管（M3，设计 2.3/2.9）：原 lead 进程死亡后，新会话收编磁盘上的团队——世代 +1
+   * 换 lead 身份、成员全部标记死亡（agentId 作废）、释放成员 in_progress 任务、
+   * 看板与信箱原样保留。活 pid 拒绝。
+   */
+  adoptTeam(request: TeamAdoptRequest): Promise<TeamAdoptResult>;
+  /**
+   * 复活补送（M3）：读成员信箱在途消息（复活简报注入用）。读不缩小信箱——消费由
+   * markMemberMessagesDelivered 在 spawn 确认后显式标记。
+   */
+  readMemberPendingMessages(memberName: string): Promise<TeamPendingMessage[]>;
+  /** 标记成员信箱消息已消费（复活 spawn 成功后调用）。 */
+  markMemberMessagesDelivered(memberName: string, messageIds: string[]): Promise<void>;
+  /**
+   * rewind 团队重置广播（M3，O8 另半边）：lead 会话 rewind 提交后调用——运行中成员
+   * steer 一条重置通知；已停成员在信箱留一条在途通知（下次唤醒补送）；lead 自己的信箱
+   * 也留一条（轮询注入，作重置的可见回执）。看板保持权威，任务不强制释放。
+   */
+  resetTeamAfterRewind(): Promise<void>;
+}
+
+/** 成员信箱在途消息的复活补送视图。 */
+export interface TeamPendingMessage {
+  messageId: string;
+  from: string;
+  summary: string;
+  message: string;
+  queuedAt: string;
 }
 
 /** 注册门特征检测：成员端口永远不满足（只有 lead 句柄实现生命周期操作）。 */

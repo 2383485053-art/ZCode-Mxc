@@ -61,6 +61,26 @@ export async function createWorktree(
   return result.ok ? { ok: true } : { ok: false, error: describeGitFailure(result, "git worktree add failed") };
 }
 
+/**
+ * 复活重挂（M3）：把已有分支挂回 worktree 路径（git worktree add <path> <branch>，
+ * 不建新分支）。分支也不存在时按新树建。先 prune 清掉「目录已删但注册残留」的悬挂。
+ */
+export async function attachWorktree(
+  repoRoot: string,
+  worktreePath: string,
+  branch: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  await runGit(repoRoot, ["worktree", "prune"]);
+  const attach = await runGit(repoRoot, ["worktree", "add", worktreePath, branch]);
+  if (attach.ok) return { ok: true };
+  // "already used/registered/checked out"：路径或分支已挂——树已存在，直接可用。
+  if (attach.stderr.includes("already")) return { ok: true };
+  const create = await runGit(repoRoot, ["worktree", "add", "-b", branch, worktreePath]);
+  return create.ok
+    ? { ok: true }
+    : { ok: false, error: describeGitFailure(create, "git worktree attach failed") };
+}
+
 /** 成员在 worktree 里是否有未提交改动（status --porcelain 非空即脏）。 */
 export async function isWorktreeDirty(worktreePath: string): Promise<boolean> {
   const result = await runGit(worktreePath, ["status", "--porcelain"]);

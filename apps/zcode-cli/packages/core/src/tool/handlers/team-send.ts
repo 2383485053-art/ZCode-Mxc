@@ -23,7 +23,10 @@ const TEAM_SEND_PROVIDER_OUTPUT_SCHEMA = {
   properties: {
     success: { type: "boolean" },
     message: { type: "string" },
-    delivery: { type: "string", enum: ["queued", "steered", "resumed_background"] },
+    delivery: {
+      type: "string",
+      enum: ["queued", "steered", "resumed_background", "interrupted"],
+    },
     failed_recipients: { type: "array", items: { type: "string" } },
   },
   required: ["success", "message"],
@@ -40,6 +43,7 @@ const TEAM_SEND_PROVIDER_DESCRIPTION = [
   "```",
   "",
   "Use teammate names as they appear in your team briefing; \"*\" delivers to everyone (lead included, yourself excluded) and reports failed_recipients for anyone who could not receive it. Messages are delivered by the team router; you do not check an inbox. Continue your current task unless the message changes or ends it.",
+  "By default (delivery \"auto\") busy teammates get the message at their next tool round and idle ones are resumed with it; delivery \"interject\" interrupts the teammate's current run and resumes it immediately with your message — reserve it for urgent corrections.",
 ].join("\n");
 
 const teamSendHandler: ToolHandler = async (input, context) => {
@@ -69,6 +73,7 @@ const teamSendHandler: ToolHandler = async (input, context) => {
     summary: parsed.summary,
     message: parsed.message,
     trace: resolveToolTraceContext(context),
+    ...(parsed.delivery !== undefined ? { delivery: parsed.delivery } : {}),
   });
   // 工具面字段是 snake_case（failedRecipients → failed_recipients），端口结果整体翻译。
   return {
@@ -152,9 +157,11 @@ function formatTeamSendModelContent(output: unknown): string {
         ? "delivery: resumed_background — the teammate was idle and was resumed in the background with your message."
         : result.delivery === "steered"
           ? "delivery: steered — the message was delivered into the teammate's active turn."
-          : result.delivery === "queued"
-            ? "delivery: queued — the message was queued for the recipient."
-            : result.message;
+          : result.delivery === "interrupted"
+            ? "delivery: interrupted — the teammate's current run was interrupted and resumed with your message."
+            : result.delivery === "queued"
+              ? "delivery: queued — the message was queued for the recipient."
+              : result.message;
     const broadcastNote =
       result.failed_recipients !== undefined && result.failed_recipients.length > 0
         ? ` Broadcast partially failed: ${result.failed_recipients.join(", ")}.`
