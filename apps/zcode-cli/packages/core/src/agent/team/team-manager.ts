@@ -67,6 +67,13 @@ const TEAM_INBOX_INFLIGHT_MAX = 32;
 /** M3 文件信箱轮询后端周期（设计 2.4：lead 信箱注入 + run 级 TeammateIdle 检测）。 */
 const TEAM_INBOX_POLL_INTERVAL_MS = 500;
 
+/**
+ * 名字即路径段（团队目录名、成员信箱文件名）：字符集白名单是路径越界的结构性防线
+ * （DeepSeek P2-3——`../x` 等成员名可拼出名册目录外的信箱路径）。与 schema 的
+ * max(32) 对齐，字母数字开头。
+ */
+const TEAM_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
+
 /** 终态判定：completed/cancelled 之后看板条目不可再改（设计 2.5）。 */
 function isTaskTerminal(status: TeamTask["status"]): boolean {
   return status === "completed" || status === "cancelled";
@@ -179,12 +186,19 @@ export class TeamManager {
     if (this.active) {
       return failed(`Team '${this.active.name}' is already active. Delete it before creating another.`);
     }
+    if (!TEAM_NAME_PATTERN.test(request.name)) {
+      return failed(
+        "Invalid team name: use 1-32 characters of letters, digits, '.', '_', '-' (start with a letter or digit).",
+        request.name,
+      );
+    }
     try {
       // 单团队互斥的跨进程半边：清扫 stale 团队（lead 已死→归档回收），活着的一律拒绝。
       for (const name of await this.store.listTeamNames()) {
         const config = await this.readConfigOrSweep(name);
         if (!config) continue;
-        if (isPidAlive(config.leadPid)) {
+        // leadReleasedAt：进程或活但 lead 会话已收尾（P1-1），按 stale 清扫归档。
+        if (!config.leadReleasedAt && isPidAlive(config.leadPid)) {
           return failed(
             `Team '${name}' is active in another session (pid ${config.leadPid}). Delete it there first.`,
           );
@@ -289,6 +303,37 @@ export class TeamManager {
   }
 
   /**
+   * 会话收尾（DeepSeek P1-1）：app.close（/new|/resume|/fork 换会话或进程退出）时由
+   * 装配层调用。停信箱轮询释放 manager；有活团时盘上标记 leadReleasedAt——进程还活着
+   * 但 lead 会话已死，pid 活性检查让位：新会话可 team_adopt 接管（世代+1 换 lead），
+   * team_create 清扫时按 stale 归档。best-effort 全兜，绝不阻断 close 链。
+   */
+  async dispose(): Promise<void> {
+    this.stopInboxPolling();
+    const active = this.active;
+    if (!active) return;
+    this.active = undefined;
+    this.roster = [];
+    this.tasks = [];
+    try {
+      const config = await this.store.readConfig(active.name);
+      // 世代不一致=可能有第二个管理者已动过（接管），不越权写盘。
+      if (config.generation === active.generation) {
+        await this.store.writeConfig(active.name, {
+          ...config,
+          leadReleasedAt: new Date().toISOString(),
+        });
+      }
+    } catch (error) {
+      this.logger?.warn?.("Team lead release on dispose failed", {
+        module: "core.agent.team",
+        team: active.name,
+        error: errorMessage(error),
+      });
+    }
+  }
+
+  /**
    * 接管（M3，设计 2.3/2.9 验收「杀 lead → 新会话接管继续」）：原 lead 进程死亡后，
    * 本会话收编磁盘团队——世代 +1 换 lead 身份、成员全标死亡（agentId 随旧进程作废，
    * worktree 保留）、释放成员 in_progress 任务、看板与信箱原样入内存。活 pid 拒绝；
@@ -302,7 +347,8 @@ export class TeamManager {
     }
     try {
       const config = await this.store.readConfig(request.name);
-      if (isPidAlive(config.leadPid)) {
+      // leadReleasedAt：进程或活但 lead 会话已收尾（P1-1），视为孤儿可接管。
+      if (!config.leadReleasedAt && isPidAlive(config.leadPid)) {
         return adoptFailed(
           `Team '${request.name}' is still active in another session (pid ${config.leadPid}). Use it there, or delete it first.`,
         );
@@ -319,6 +365,8 @@ export class TeamManager {
         members,
         leadSessionId: this.leadSessionId,
         leadPid: process.pid,
+        // 接管即新 lead 在位，清掉释放标记（P1-1）。
+        leadReleasedAt: undefined,
         generation,
       });
       this.active = { name: request.name, generation };
@@ -468,6 +516,11 @@ export class TeamManager {
     }
     if (registration.name === "lead") {
       return rosterFailed("'lead' is reserved for the lead; pick another teammate name.");
+    }
+    if (!TEAM_NAME_PATTERN.test(registration.name)) {
+      return rosterFailed(
+        `Invalid teammate name '${registration.name}': use 1-32 characters of letters, digits, '.', '_', '-' (start with a letter or digit).`,
+      );
     }
     let revival = false;
     const existing = this.roster.find((member) => member.name === registration.name);

@@ -171,6 +171,17 @@ export function createDefaultSubagentPort(
         request,
         childMcpAccess.snapshot?.tools.map((descriptor) => toMcpToolName(descriptor)) ?? [],
       );
+      // Agent Teams（DeepSeek P1-3 方案A）：readOnly 成员的文件写被 FS gate 全拒，但
+      // Bash 不经 fileSystemPort——shell 重定向即绕过只读约束。spawn 时直接剥掉 Bash
+      // 工具（模型看不到它，也不会反复撞 veto）。成员不在名册（普通 spawn/异常）时
+      // policy 为空对象，行为不变。
+      const teamMemberReadOnly =
+        request.teamMemberName !== undefined &&
+        isLeadTeamPort(deps.teamPort) &&
+        deps.teamPort.getMemberWritePolicy(request.teamMemberName).readOnly === true;
+      const memberToolAllowlist = teamMemberReadOnly
+        ? childToolAllowlist.filter((toolName) => toolName !== "Bash")
+        : childToolAllowlist;
       validateSubagentMcpRequirements(request, childToolAllowlist, childMcpAccess);
       const childMode = resolveSubagentPermissionMode(
         this.getPlanEnabled() ? "plan" : this.config.mode,
@@ -282,7 +293,7 @@ export function createDefaultSubagentPort(
           // 默认 subagent 已从 Explore 调整为 general-purpose。
           // toolset 不能再依赖 DEFAULT_SUBAGENT_TYPE，否则默认通用 agent 会被误降级为只读搜索工具面。
           toolset: builtInExplore ? "explore" : "main",
-          toolAllowlist: childToolAllowlist,
+          toolAllowlist: memberToolAllowlist,
           toolDisallowlist: this.config.toolDisallowlist,
           embeddedSearchBackend: this.config.embeddedSearchBackend,
           nativeSearchEnhancementsEnabled: this.config.nativeSearchEnhancementsEnabled,
