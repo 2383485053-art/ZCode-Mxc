@@ -12,7 +12,11 @@ import {
   formatLogPrefix,
   formatZodError,
 } from "@zcode/shared";
-import type { ISettingService } from "./setting.js";
+import type { AgentTeamsConfig, ISettingService } from "./setting.js";
+import {
+  getAgentTeamsConfig as readUserAgentTeamsConfig,
+  updateAgentTeamsConfig as writeUserAgentTeamsConfig,
+} from "./userCliConfig.js";
 import { normalizeSettingsPatch } from "#src/setting/normalizeSettingsPatch.js";
 import { copyDataDirectory, getDataBaseDir, validateDataBaseDirTarget } from "../paths.js";
 import { isEffectiveDevelopmentNodeEnv } from "../runtime-tools/nodeEnv.js";
@@ -373,6 +377,14 @@ export function createSettingServiceWithMigrations(): {
       }
 
       return { path, created: !existedBefore };
+    },
+
+    async getAgentTeamsConfig(): Promise<AgentTeamsConfig> {
+      return readUserAgentTeamsConfig();
+    },
+
+    async updateAgentTeamsConfig(patch: Partial<AgentTeamsConfig>): Promise<AgentTeamsConfig> {
+      return writeUserAgentTeamsConfig(patch);
     },
   };
 
