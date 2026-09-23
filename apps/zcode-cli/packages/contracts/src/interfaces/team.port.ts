@@ -47,6 +47,10 @@ export const TEAM_CONFIG_FILE_SCHEMA = z.object({
   teamName: z.string().min(1).max(32),
   leadSessionId: z.string().min(1),
   leadPid: z.number().int().positive(),
+  // P1-1：lead 会话收尾（app.close，/new|/resume|/fork 换会话）时写入——进程还活着
+  // 但 lead 会话已死，pid 活性检查让位（新会话可 adopt 接管、createTeam 清扫归档）。
+  // adopt 接管时随新 leadPid 一起清掉。
+  leadReleasedAt: z.string().min(1).optional(),
   members: z.array(TEAM_MEMBER_SCHEMA),
   createdAt: z.string().min(1),
   generation: z.number().int().positive(),

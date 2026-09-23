@@ -115,7 +115,9 @@ function relativePosix(from: string, to: string): string {
  * 目录型 scope（src/auth/**）同时覆盖目录自身与其下所有内容。
  */
 export function matchesAnyScope(repoRelativePath: string, scopes: string[]): boolean {
-  return scopes.some((scope) => globMatches(scope, repoRelativePath));
+  // Windows 风格反斜杠 scope（src\auth\**）在 globToRegExp 按 / 切分后整段失配，
+  // posix 相对路径永不匹配——入口归一到 /（DeepSeek P2-1）。
+  return scopes.some((scope) => globMatches(scope.replace(/\\/g, "/"), repoRelativePath));
 }
 
 export function globMatches(pattern: string, path: string): boolean {

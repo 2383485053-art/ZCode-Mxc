@@ -1163,6 +1163,10 @@ export async function createZCodeApp(options: ZCodeAppOptions): Promise<ZCodeApp
         try {
           await closeSession?.();
         } finally {
+          // Agent Teams（DeepSeek P1-1）：lead 会话收尾——停信箱轮询；有活团盘上标记
+          // leadReleasedAt，否则 /new|/resume|/fork 后旧轮询泄漏、且本进程活 pid 把
+          // create/adopt/delete 挡死无自愈。dispose best-effort 全兜，不阻断 close 链。
+          await teamManager.dispose();
           try {
             providerModelRuntime?.dispose();
           } finally {
