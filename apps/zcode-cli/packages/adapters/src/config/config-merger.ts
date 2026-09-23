@@ -42,6 +42,8 @@ export function mergeConfigs(...configs: PrioritizedConfig[]): RuntimeConfigPatc
         : inputConfig;
     const previousHooks = result.hooks;
     const previousPlugins = result.plugins;
+    const previousFeatures = result.features;
+    const previousTeam = result.team;
     Object.assign(result, config);
 
     // Deep merge nested objects
@@ -58,7 +60,13 @@ export function mergeConfigs(...configs: PrioritizedConfig[]): RuntimeConfigPatc
       result.network = { ...result.network, ...config.network };
     }
     if (config.features) {
-      result.features = { ...result.features, ...config.features };
+      // Object.assign 已把 result.features 指向当前层，展开 result.features 只是自合并
+      // 空转；必须从 previousFeatures 起，否则高优先级层声明任意 features 键就会把
+      // 低优先级层的 features.agentTeams 等整层抹掉（plugins 先例同病同修）。
+      result.features = { ...previousFeatures, ...config.features };
+    }
+    if (config.team) {
+      result.team = { ...previousTeam, ...config.team };
     }
     if (config.memory) {
       result.memory = { ...result.memory, ...config.memory };
