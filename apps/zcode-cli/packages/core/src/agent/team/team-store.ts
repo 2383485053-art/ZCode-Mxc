@@ -176,10 +176,15 @@ export class TeamStore {
         .map((message) => message.messageId),
     );
     if (inbox.messages.length > 50) {
+      // 在途超额（绕配额写入的历史脏文件）时 50-size 为负，slice(-负数)=从头保留会把
+      // 已消费尾整段留下、数组仍 >50，下一次读取即 schema 失败。钳到 0 保住不变量。
+      const keepDeliveredCount = Math.max(0, 50 - inflightIds.size);
+      const deliveredMessages = inbox.messages.filter(
+        (message) => message.deliveredAt !== undefined,
+      );
       const keepDeliveredIds = new Set(
-        inbox.messages
-          .filter((message) => message.deliveredAt !== undefined)
-          .slice(-(50 - inflightIds.size))
+        deliveredMessages
+          .slice(deliveredMessages.length - keepDeliveredCount)
           .map((message) => message.messageId),
       );
       inbox.messages = inbox.messages.filter(
@@ -191,8 +196,8 @@ export class TeamStore {
   }
 
   /**
-   * 读信箱（M3 消费语义）。文件不存在 = 空箱；损坏 = 隔离重置（与 append 同款语义：
-   * 丢历史镜像不丢消息本体——在途消息的真相在投递结局应答里，已消费条目只是审计尾）。
+   * 读信箱（M3 消费语义）。文件不存在 = 空箱；损坏/超额 = 抛 TeamStoreError——
+   * 在途消息唯一真相在文件里，静默返空等于授权下一次写入整体覆写丢光（P1-5）。
    */
   async readInbox(teamName: string, member: string): Promise<TeamInboxFile> {
     return this.readInboxRaw(teamName, member);
@@ -215,11 +220,35 @@ export class TeamStore {
 
   private async readInboxRaw(teamName: string, member: string): Promise<TeamInboxFile> {
     const path = this.location(teamName).inboxPath(member);
+    let raw: string;
     try {
-      return TEAM_INBOX_FILE_SCHEMA.parse(JSON.parse(await readFile(path, "utf8")));
-    } catch {
-      return { schemaVersion: 1, messages: [] };
+      raw = await readFile(path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return { schemaVersion: 1, messages: [] };
+      }
+      throw new TeamStoreError(`Cannot read ${path}`, "io_error", error);
     }
+    // 损坏/超额(>50)文件宁报错不可静默返空：在途消息的唯一真相就是这份文件，
+    // 返空会让下一次 append/markDelivered 以空箱为准整体覆写，静默丢光全部消息
+    // （DeepSeek 审查 P1-5 链尾）。语义与 readBoard 一致：lead 人工处理文件后重试。
+    let parsed: ReturnType<typeof TEAM_INBOX_FILE_SCHEMA.safeParse>;
+    try {
+      parsed = TEAM_INBOX_FILE_SCHEMA.safeParse(JSON.parse(raw));
+    } catch (error) {
+      throw new TeamStoreError(
+        `Team '${teamName}' inbox for '${member}' is invalid: ${(error as Error).message}`,
+        "config_invalid",
+        error,
+      );
+    }
+    if (!parsed.success) {
+      throw new TeamStoreError(
+        `Team '${teamName}' inbox for '${member}' is invalid: ${parsed.error.message}`,
+        "config_invalid",
+      );
+    }
+    return parsed.data;
   }
 
   /**

@@ -51,6 +51,8 @@ import {
 import { attachWorktree, commitAll, createWorktree, diffFiles, isCheckoutDirty, isGitRepository, isWorktreeDirty, mergeBaseOf, mergeBranch, removeWorktree, runGit } from "./team-git.js";
 import { matchesAnyScope } from "./team-write-policy.js";
 import { isPidAlive, TeamStore, TeamStoreError } from "./team-store.js";
+// 与 runtime steer 共用同一条注入上限（P1-2 分批注入的切批基准）。
+import { MAX_TURN_STEER_INPUT_BYTES } from "../../runtime/helpers/steering.js";
 
 /** 成员默认上限（设计 2.3 的 3-5 甜点）；settings 键 team.maxTeammates 随治理层 PR 接入。 */
 const DEFAULT_MAX_TEAMMATES = 5;
@@ -1519,13 +1521,40 @@ export class TeamManager {
     return open.length > 0 ? open : "(none)";
   }
 
-  /** M3 信箱写入（原 M1 镜像）：在途条目落盘即真相，失败告警不阻断应答。 */
+  /**
+   * M3 信箱写入（原 M1 镜像）：在途条目落盘即真相，失败告警不阻断应答。
+   * 配额在此收口（send() 的预检只服务模型可读的拒绝话术）：镜像/回执/广播通知等
+   * 系统侧调用点（resetTeamAfterRewind、cc-lead 回执）不经 send()，若不在此拦，
+   * 在途可超 32 → 截尾数学破裂 → 文件破 schema → 读取返空 → 下次写入整箱抹掉
+   * （DeepSeek 审查 P1-5 链头）。拒绝即跳过+告警——系统侧条目是 best-effort 镜像。
+   */
   private async enqueueInbox(
     to: string,
     entry: Parameters<TeamStore["appendInboxMessage"]>[2],
   ): Promise<void> {
     if (!this.active) return;
+    const payloadBytes = Buffer.byteLength(`${entry.summary}\n${entry.message}`, "utf8");
+    if (payloadBytes > TEAM_MESSAGE_MAX_BYTES) {
+      this.logger?.warn?.("Team inbox write skipped: message exceeds size quota", {
+        module: "core.agent.team",
+        team: this.active.name,
+        messageId: entry.messageId,
+        payloadBytes,
+      });
+      return;
+    }
     try {
+      const inbox = await this.store.readInbox(this.active.name, to);
+      const inflight = inbox.messages.filter((message) => message.deliveredAt === undefined);
+      if (inflight.length >= TEAM_INBOX_INFLIGHT_MAX) {
+        this.logger?.warn?.("Team inbox write skipped: inflight quota reached", {
+          module: "core.agent.team",
+          team: this.active.name,
+          to,
+          inflight: inflight.length,
+        });
+        return;
+      }
       await this.store.appendInboxMessage(this.active.name, to, entry);
     } catch (error) {
       this.logger?.warn?.("Team inbox write failed", {
@@ -1595,9 +1624,15 @@ export class TeamManager {
   }
 
   /**
-   * lead 信箱泵：在途消息合并成一条合成输入，经注入钩子进 lead 的活跃 turn（工具
+   * lead 信箱泵：在途消息合并成合成输入，经注入钩子进 lead 的活跃 turn（工具
    * 边界 steer，与成员收件同款原语）。无活跃 turn 时留在信箱下一轮再试——节流日志
    * 防刷屏。注入成功即标消费。
+   *
+   * 分批注入（P1-2）：全量拼接超 MAX_TURN_STEER_INPUT_BYTES 会被 steer 永久拒收
+   * （input_too_large 且 injected=false），在途永远不消化 = 队头永久阻塞。按字节
+   * 上限切批逐条注入，每批独立标消费；某批失败（turn 恰好收束）即停，余量留待
+   * 下轮。配额收口后单条 ≤32KiB，正常批次恒非空；历史脏文件里单条超限的条目
+   * 注不进去也永不清化，告警后标消费放行队列。
    */
   private async pumpLeadInbox(team: string): Promise<void> {
     if (this.leadInboxTarget === undefined) return;
@@ -1607,20 +1642,63 @@ export class TeamManager {
       this.injectFailureStreak = 0;
       return;
     }
-    const text = pending
-      .map((message) => `[team inbox] ${message.from} → lead\n${message.message}`)
-      .join("\n---\n");
-    let injected = false;
-    try {
-      injected = await this.leadInboxTarget.inject(text);
-    } catch (error) {
-      this.logger?.warn?.("Team lead inbox inject failed", {
-        module: "core.agent.team",
-        team,
-        error: errorMessage(error),
-      });
+    const separator = "\n---\n";
+    const formatLine = (message: (typeof pending)[number]) =>
+      `[team inbox] ${message.from} → lead\n${message.message}`;
+    const batches: Array<Array<(typeof pending)[number]>> = [];
+    const uninjectableIds: string[] = [];
+    let currentBatch: Array<(typeof pending)[number]> = [];
+    let currentBytes = 0;
+    const flushBatch = () => {
+      if (currentBatch.length === 0) return;
+      batches.push(currentBatch);
+      currentBatch = [];
+      currentBytes = 0;
+    };
+    for (const message of pending) {
+      const lineBytes = Buffer.byteLength(formatLine(message), "utf8");
+      if (lineBytes > MAX_TURN_STEER_INPUT_BYTES) {
+        // 单条即超限（只可能来自配额收口前的历史文件）：steer 恒拒收，注不进去也
+        // 永不清化；告警后免注入直接标消费，放行队列余量。
+        this.logger?.warn?.("Team lead inbox entry exceeds steer limit; dropping to unblock queue", {
+          module: "core.agent.team",
+          team,
+          messageId: message.messageId,
+          lineBytes,
+        });
+        uninjectableIds.push(message.messageId);
+        continue;
+      }
+      const addition =
+        currentBatch.length === 0
+          ? lineBytes
+          : lineBytes + Buffer.byteLength(separator, "utf8");
+      if (currentBytes + addition > MAX_TURN_STEER_INPUT_BYTES) flushBatch();
+      currentBatch.push(message);
+      currentBytes += addition;
     }
-    if (!injected) {
+    flushBatch();
+    if (uninjectableIds.length > 0) {
+      await this.markDelivered("lead", ...uninjectableIds);
+    }
+
+    let injectedAny = false;
+    for (const batch of batches) {
+      let injected = false;
+      try {
+        injected = await this.leadInboxTarget.inject(batch.map(formatLine).join(separator));
+      } catch (error) {
+        this.logger?.warn?.("Team lead inbox inject failed", {
+          module: "core.agent.team",
+          team,
+          error: errorMessage(error),
+        });
+      }
+      if (!injected) break;
+      injectedAny = true;
+      await this.markDelivered("lead", ...batch.map((message) => message.messageId));
+    }
+    if (!injectedAny) {
       this.injectFailureStreak += 1;
       if (this.injectFailureStreak % 20 === 1) {
         this.logger?.info?.("Team lead inbox waiting for an active lead turn", {
@@ -1632,7 +1710,6 @@ export class TeamManager {
       return;
     }
     this.injectFailureStreak = 0;
-    await this.markDelivered("lead", ...pending.map((message) => message.messageId));
   }
 
   /**
