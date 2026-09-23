@@ -3533,6 +3533,15 @@ const enUS: Record<string, string> = {
   "settings.subagents.title": "Subagents",
   "settings.subagents.description":
     "Manage user-level subagent Markdown files consumed by ZCode Agent.",
+  "settings.agentTeams.title": "Agent Teams",
+  "settings.agentTeams.enable": "Enable Agent Teams",
+  "settings.agentTeams.enableDescription":
+    "When enabled, the lead agent can create teams, split tasks and merge teammate output. Changes apply to sessions started afterwards.",
+  "settings.agentTeams.maxTeammates": "Team size limit",
+  "settings.agentTeams.maxTeammatesDescription":
+    "Maximum number of teammates in one team (1-16).",
+  "settings.agentTeams.loadFailed": "Failed to load Agent Teams settings. Please retry.",
+  "settings.agentTeams.updateFailed": "Failed to save Agent Teams settings",
   "settings.subagents.workspaceScopeUnsupported":
     "Workspace-level creation or editing is unsupported",
   "settings.subagents.searchPlaceholder": "Search subagents...",
